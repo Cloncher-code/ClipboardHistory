@@ -100,6 +100,9 @@ class ClipboardManager: ObservableObject {
     @Published var lists: [String] = [] {
         didSet { saveLists() }
     }
+    @Published var excludedApps: [String] = [] {   // bundle ID приложений-исключений
+        didSet { UserDefaults.standard.set(excludedApps, forKey: "excludedApps") }
+    }
 
     private var timer: Timer?
     private var cleanupTimer: Timer?
@@ -148,6 +151,7 @@ class ClipboardManager: ObservableObject {
 
         load()
         loadLists()
+        excludedApps = UserDefaults.standard.stringArray(forKey: "excludedApps") ?? []
         cleanupOldItems()
 
         // Опрос буфера каждые полсекунды (macOS не умеет уведомлять сама).
@@ -174,6 +178,9 @@ class ClipboardManager: ObservableObject {
 
         // Приложение, из которого только что скопировали (для иконки записи).
         let source = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+
+        // Если это приложение-исключение — ничего не записываем.
+        if let source, excludedApps.contains(source) { return }
 
         var added = false
         if types.contains(.fileURL) {
@@ -383,6 +390,17 @@ class ClipboardManager: ObservableObject {
         for index in history.indices where history[index].listName == name {
             history[index].listName = nil
         }
+    }
+
+    // MARK: Исключения
+
+    func addExcludedApp(_ bundleID: String) {
+        guard !bundleID.isEmpty, !excludedApps.contains(bundleID) else { return }
+        excludedApps.append(bundleID)
+    }
+
+    func removeExcludedApp(_ bundleID: String) {
+        excludedApps.removeAll { $0 == bundleID }
     }
 
     // MARK: Хранение
@@ -626,14 +644,16 @@ struct HistoryView: View {
     @State private var selectedIndex = 0
     @State private var previewItem: ClipboardItem?
     @State private var keyMonitor: Any?
+    @State private var showAddList = false
+    @State private var newListName = ""
 
     @AppStorage("autoPaste") private var autoPaste = false
     @AppStorage("compactMode") private var compactMode = false
 
     private var filteredItems: [ClipboardItem] {
-        var items = manager.history.sorted { $0.isPinned && !$1.isPinned }
+        var items = manager.history
         switch filter {
-        case .all: break
+        case .all: items = items.filter { !$0.isPinned }   // закреплённые — в своём списке
         case .pinned: items = items.filter { $0.isPinned }
         case .list(let name): items = items.filter { $0.listName == name }
         }
@@ -671,10 +691,23 @@ struct HistoryView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     chip("Все", .all)
-                    chip("📌", .pinned)
+                    chip("📌 Закреп", .pinned)
                     ForEach(manager.lists, id: \.self) { name in
                         chip(name, .list(name))
                     }
+                    // Плюсик: добавить список не заходя в настройки.
+                    Button {
+                        newListName = ""
+                        showAddList = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Новый список")
                 }
                 .padding(.horizontal, 8)
             }
@@ -744,6 +777,15 @@ struct HistoryView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .sheet(item: $previewItem) { item in
             PreviewView(item: item, manager: manager)
+        }
+        .alert("Новый список", isPresented: $showAddList) {
+            TextField("Название", text: $newListName)
+            Button("Добавить") {
+                let name = newListName.trimmingCharacters(in: .whitespaces)
+                manager.addList(name)
+                if !name.isEmpty { filter = .list(name) }   // сразу переключиться на него
+            }
+            Button("Отмена", role: .cancel) {}
         }
         .onAppear { installKeyMonitor() }
         .onDisappear { removeKeyMonitor() }
@@ -1012,10 +1054,12 @@ struct SettingsView: View {
                 .tabItem { Label("Звук", systemImage: "speaker.wave.2.fill") }
             ListsSettingsTab(manager: manager)
                 .tabItem { Label("Списки", systemImage: "list.bullet") }
-            SecuritySettingsTab()
-                .tabItem { Label("Безопасность", systemImage: "lock.fill") }
+            ExclusionsSettingsTab(manager: manager)
+                .tabItem { Label("Исключения", systemImage: "nosign") }
+            InfoSettingsTab()
+                .tabItem { Label("Информация", systemImage: "info.circle") }
         }
-        .frame(width: 470, height: 400)
+        .frame(width: 480, height: 410)
     }
 }
 
@@ -1186,13 +1230,44 @@ struct ListsSettingsTab: View {
     }
 }
 
-// Вкладка «Безопасность».
-struct SecuritySettingsTab: View {
+// Вкладка «Исключения»: приложения, из которых не записываем буфер, + пароли.
+struct ExclusionsSettingsTab: View {
+    @ObservedObject var manager: ClipboardManager
     @AppStorage("savePasswords") private var savePasswords = false
 
     var body: some View {
         Form {
-            Section {
+            Section("Приложения-исключения") {
+                if manager.excludedApps.isEmpty {
+                    Text("Пока нет исключений")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(manager.excludedApps, id: \.self) { bundleID in
+                    HStack {
+                        if let icon = AppIcon.icon(for: bundleID) {
+                            Image(nsImage: icon)
+                                .resizable()
+                                .frame(width: 18, height: 18)
+                        }
+                        Text(appName(for: bundleID))
+                        Spacer()
+                        Button {
+                            manager.removeExcludedApp(bundleID)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Убрать из исключений")
+                    }
+                }
+                Button("Добавить приложение…") { pickApp() }
+                Text("Из выбранных приложений скопированное не попадает в историю.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section("Пароли") {
                 Toggle("Сохранять пароли в историю", isOn: $savePasswords)
                 Text("Не рекомендуется: пароли будут лежать на диске в открытом виде, и их сможет прочитать любая программа или человек за этим Mac. Безопаснее оставить выключенным и хранить пароли только в менеджере паролей.")
                     .font(.caption)
@@ -1201,6 +1276,63 @@ struct SecuritySettingsTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    // Понятное имя приложения по bundle ID.
+    private func appName(for bundleID: String) -> String {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+            return url.deletingPathExtension().lastPathComponent
+        }
+        return bundleID
+    }
+
+    // Выбор .app через системную панель; берём его bundle ID.
+    private func pickApp() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Добавить"
+        if panel.runModal() == .OK,
+           let url = panel.url,
+           let bundleID = Bundle(url: url)?.bundleIdentifier {
+            manager.addExcludedApp(bundleID)
+        }
+    }
+}
+
+// Вкладка «Информация»: о проекте и ссылка на GitHub.
+struct InfoSettingsTab: View {
+    private var version: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(v) (\(b))"
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+            Text("ClipboardHistory")
+                .font(.title2).bold()
+            Text("Версия \(version)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Менеджер буфера обмена для macOS с историей, поиском, списками и быстрой вставкой. Открытый проект.")
+                .font(.callout)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal)
+            Link("Открыть на GitHub",
+                 destination: URL(string: "https://github.com/Cloncher-code/ClipboardHistory")!)
+                .buttonStyle(.borderedProminent)
+            Spacer()
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
