@@ -67,16 +67,30 @@ enum Stamp {
 
 // MARK: - Иконки приложений-источников (с кэшем)
 enum AppIcon {
-    private static var cache: [String: NSImage] = [:]
+    private static let cache = NSCache<NSString, NSImage>()
     static func icon(for bundleID: String?) -> NSImage? {
         guard let bundleID else { return nil }
-        if let cached = cache[bundleID] { return cached }
+        if let cached = cache.object(forKey: bundleID as NSString) { return cached }
         guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
             return nil
         }
         let icon = NSWorkspace.shared.icon(forFile: url.path)
-        cache[bundleID] = icon
+        cache.setObject(icon, forKey: bundleID as NSString)
         return icon
+    }
+}
+
+// MARK: - Кэш картинок (меньше чтений с диска при прокрутке, экономия памяти)
+enum ImageCache {
+    private static let cache = NSCache<NSString, NSImage>()
+    static func image(at url: URL, key: String) -> NSImage? {
+        if let cached = cache.object(forKey: key as NSString) { return cached }
+        guard let img = NSImage(contentsOf: url) else { return nil }
+        cache.setObject(img, forKey: key as NSString)
+        return img
+    }
+    static func drop(_ key: String) {
+        cache.removeObject(forKey: key as NSString)
     }
 }
 
@@ -91,21 +105,91 @@ enum Sounds {
     }
 }
 
+// MARK: - Опции для настройки глобального хоткея
+struct ModifierOption: Hashable { let name: String; let flags: Int }
+let hotkeyModifierOptions: [ModifierOption] = [
+    ModifierOption(name: "⇧⌘",  flags: cmdKey | shiftKey),
+    ModifierOption(name: "⌃⌘",  flags: cmdKey | controlKey),
+    ModifierOption(name: "⌥⌘",  flags: cmdKey | optionKey),
+    ModifierOption(name: "⌃⌥",  flags: controlKey | optionKey),
+    ModifierOption(name: "⌃⌥⌘", flags: cmdKey | controlKey | optionKey)
+]
+let hotkeyKeyOptions: [(name: String, code: Int)] = [
+    ("V", 9), ("C", 8), ("B", 11), ("X", 7), ("Z", 6),
+    ("A", 0), ("S", 1), ("D", 2), ("Пробел", 49)
+]
+
+// MARK: - Простой чекер обновлений через GitHub Releases
+enum UpdateOutcome {
+    case upToDate
+    case newer(String)
+    case noReleases
+    case failed(String)
+}
+
+enum UpdateChecker {
+    static let repo = "https://github.com/Cloncher-code/ClipboardHistory"
+    static let api = "https://api.github.com/repos/Cloncher-code/ClipboardHistory/releases/latest"
+
+    static func check() async -> UpdateOutcome {
+        guard let url = URL(string: api) else { return .failed("Неверный адрес") }
+        var req = URLRequest(url: url)
+        // GitHub API требует User-Agent и рекомендует заголовок Accept.
+        req.setValue("ClipboardHistory-app", forHTTPHeaderField: "User-Agent")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 404 { return .noReleases }              // релизов ещё нет
+            guard code == 200 else { return .failed("Код ответа \(code)") }
+            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tag = obj["tag_name"] as? String else {
+                return .failed("Не удалось разобрать ответ")
+            }
+            let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
+            return isNewer(tag, than: current) ? .newer(tag) : .upToDate
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+
+    // Сравнение версий вида "v1.2.3" / "1.2.3".
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+             .split(separator: ".")
+             .map { Int($0.prefix(while: { $0.isNumber })) ?? 0 }
+        }
+        let pa = parts(a), pb = parts(b)
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+}
+
 // MARK: - Менеджер буфера обмена
 
 class ClipboardManager: ObservableObject {
     @Published var history: [ClipboardItem] = [] {
-        didSet { save() }
+        didSet { scheduleSave() }
     }
     @Published var lists: [String] = [] {
         didSet { saveLists() }
     }
+    @Published var smartLists: [SmartList] = [] {
+        didSet { saveSmartLists() }
+    }
     @Published var excludedApps: [String] = [] {   // bundle ID приложений-исключений
         didSet { UserDefaults.standard.set(excludedApps, forKey: "excludedApps") }
     }
+    @Published var openToken = 0   // меняется при каждом открытии панели (для прокрутки вверх)
 
     private var timer: Timer?
     private var cleanupTimer: Timer?
+    private var saveWorkItem: DispatchWorkItem?    // отложенное сохранение истории
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
     private let storageKey = "clipboardHistory"
     private let listsKey = "userLists"
@@ -146,11 +230,16 @@ class ClipboardManager: ObservableObject {
             "autoPaste": false,
             "captureSoundName": "Tink",
             "historySoundName": "Pop",
-            "compactMode": false
+            "compactMode": false,
+            "hotkeyKeyCode": 9,                    // V
+            "hotkeyModifiers": cmdKey | shiftKey   // ⇧⌘
         ])
 
         load()
         loadLists()
+        loadSmartLists()
+        // 📌 — обычный список, существующий по умолчанию (бывшее «закрепление»).
+        if !lists.contains("📌") { lists.insert("📌", at: 0) }
         excludedApps = UserDefaults.standard.stringArray(forKey: "excludedApps") ?? []
         cleanupOldItems()
 
@@ -312,7 +401,8 @@ class ClipboardManager: ObservableObject {
 
     func loadImage(_ item: ClipboardItem) -> NSImage? {
         guard let filename = item.imageFilename else { return nil }
-        return NSImage(contentsOf: attachmentsDirectory.appendingPathComponent(filename))
+        let url = attachmentsDirectory.appendingPathComponent(filename)
+        return ImageCache.image(at: url, key: filename)
     }
 
     // PNG-данные картинки на диске (для «Сохранить изображение»).
@@ -323,6 +413,7 @@ class ClipboardManager: ObservableObject {
 
     private func removeAttachmentFiles(_ item: ClipboardItem) {
         if let name = item.imageFilename {
+            ImageCache.drop(name)
             try? FileManager.default.removeItem(at: attachmentsDirectory.appendingPathComponent(name))
         }
         if let name = item.rtfFilename {
@@ -333,31 +424,27 @@ class ClipboardManager: ObservableObject {
     // MARK: Управление записями
 
     func trimHistory() {
-        var unpinnedCount = history.filter { !$0.isPinned }.count
-        while unpinnedCount > maxItems {
-            if let index = history.lastIndex(where: { !$0.isPinned }) {
+        // В лимит истории попадают только записи без списка.
+        // Всё, что разложено по спискам (включая 📌), от лимита защищено.
+        var freeCount = history.filter { $0.listName == nil }.count
+        while freeCount > maxItems {
+            if let index = history.lastIndex(where: { $0.listName == nil }) {
                 removeAttachmentFiles(history[index])
                 history.remove(at: index)
-                unpinnedCount -= 1
+                freeCount -= 1
             } else { break }
         }
     }
 
-    // Автоочистка: удаляем незакреплённые записи старше N дней (0 — выключено).
+    // Автоочистка: удаляем записи без списка старше N дней (0 — выключено).
     func cleanupOldItems() {
         let days = cleanupDays
         guard days > 0 else { return }
         let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
-        let expired = history.filter { !$0.isPinned && $0.date < cutoff }
+        let expired = history.filter { $0.listName == nil && $0.date < cutoff }
         guard !expired.isEmpty else { return }
         expired.forEach(removeAttachmentFiles)
-        history.removeAll { !$0.isPinned && $0.date < cutoff }
-    }
-
-    func togglePin(_ item: ClipboardItem) {
-        if let index = history.firstIndex(where: { $0.id == item.id }) {
-            history[index].isPinned.toggle()
-        }
+        history.removeAll { $0.listName == nil && $0.date < cutoff }
     }
 
     func assign(_ item: ClipboardItem, toList list: String?) {
@@ -372,8 +459,9 @@ class ClipboardManager: ObservableObject {
     }
 
     func clearHistory() {
-        history.filter { !$0.isPinned }.forEach(removeAttachmentFiles)
-        history.removeAll { !$0.isPinned }
+        // Очищаем только записи без списка; разложенное по спискам остаётся.
+        history.filter { $0.listName == nil }.forEach(removeAttachmentFiles)
+        history.removeAll { $0.listName == nil }
     }
 
     // MARK: Списки
@@ -389,6 +477,41 @@ class ClipboardManager: ObservableObject {
         // Записи из удалённого списка не пропадают, просто остаются без списка.
         for index in history.indices where history[index].listName == name {
             history[index].listName = nil
+        }
+    }
+
+    func moveList(from source: IndexSet, to destination: Int) {
+        lists.move(fromOffsets: source, toOffset: destination)
+    }
+
+    // MARK: Умные списки
+
+    func saveSmartList(_ sl: SmartList) {
+        if let i = smartLists.firstIndex(where: { $0.id == sl.id }) {
+            smartLists[i] = sl
+        } else {
+            smartLists.append(sl)
+        }
+    }
+
+    func deleteSmartList(_ sl: SmartList) {
+        smartLists.removeAll { $0.id == sl.id }
+    }
+
+    // Ручной текстовый клип — добавить произвольный текст в историю.
+    func addManualText(_ text: String) {
+        addText(text, rtfData: nil, source: nil)
+    }
+
+    private func saveSmartLists() {
+        if let data = try? JSONEncoder().encode(smartLists) {
+            UserDefaults.standard.set(data, forKey: "smartLists")
+        }
+    }
+    private func loadSmartLists() {
+        if let data = UserDefaults.standard.data(forKey: "smartLists"),
+           let saved = try? JSONDecoder().decode([SmartList].self, from: data) {
+            smartLists = saved
         }
     }
 
@@ -409,6 +532,19 @@ class ClipboardManager: ObservableObject {
         if let data = try? JSONEncoder().encode(history) {
             UserDefaults.standard.set(data, forKey: storageKey)
         }
+    }
+    // Отложенное сохранение: собираем серию изменений в одну запись на диск.
+    private func scheduleSave() {
+        saveWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.save() }
+        saveWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+    // Немедленно сохранить (например, при выходе из приложения).
+    func flush() {
+        saveWorkItem?.cancel()
+        saveWorkItem = nil
+        save()
     }
     private func load() {
         if let data = UserDefaults.standard.data(forKey: storageKey),
@@ -453,6 +589,7 @@ enum PasteHelper {
 
 class HotKeyManager {
     private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
     private let handler: () -> Void
 
     init(handler: @escaping () -> Void) {
@@ -460,25 +597,36 @@ class HotKeyManager {
 
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
                                       eventKind: UInt32(kEventHotKeyPressed))
-
         InstallEventHandler(GetApplicationEventTarget(), { _, _, userData -> OSStatus in
             guard let userData else { return noErr }
             let manager = Unmanaged<HotKeyManager>.fromOpaque(userData).takeUnretainedValue()
             DispatchQueue.main.async { manager.handler() }
             return noErr
-        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), nil)
+        }, 1, &eventType, Unmanaged.passUnretained(self).toOpaque(), &handlerRef)
 
+        register()
+    }
+
+    // Регистрируем хоткей по текущим настройкам (можно вызывать повторно).
+    func register() {
+        unregister()
+        let keyCode = UInt32(UserDefaults.standard.integer(forKey: "hotkeyKeyCode"))
+        let mods = UInt32(UserDefaults.standard.integer(forKey: "hotkeyModifiers"))
         let hotKeyID = EventHotKeyID(signature: OSType(0x434C4950), id: 1)  // 'CLIP'
-        RegisterEventHotKey(UInt32(kVK_ANSI_V),
-                            UInt32(cmdKey | shiftKey),
-                            hotKeyID,
-                            GetApplicationEventTarget(),
-                            0,
-                            &hotKeyRef)
+        RegisterEventHotKey(keyCode, mods, hotKeyID,
+                            GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    func unregister() {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+            self.hotKeyRef = nil
+        }
     }
 
     deinit {
-        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        unregister()
+        if let handlerRef { RemoveEventHandler(handlerRef) }
     }
 }
 
@@ -502,6 +650,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var previousApp: NSRunningApplication?  // кто был активен до открытия панели
     private var clickMonitor: Any?                  // следит за кликами вне панели
     private var settingsWindow: NSWindow?           // отдельное окно настроек
+    private var databaseWindow: NSWindow?           // окно просмотра базы
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
@@ -540,6 +689,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             // Запоминаем активное приложение — в него потом будем вставлять.
             previousApp = NSWorkspace.shared.frontmostApplication
+            manager.openToken += 1   // сигнал панели прокрутиться вверх
             positionPanel()
             // orderFrontRegardless показывает панель БЕЗ активации приложения,
             // поэтому из полноэкранного режима нас не выкидывает.
@@ -595,6 +745,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Перепривязать глобальный хоткей после изменения в настройках.
+    func reregisterHotKey() {
+        hotKey?.register()
+    }
+
+    // Гарантированно сохраняем историю при выходе (на случай отложенной записи).
+    func applicationWillTerminate(_ notification: Notification) {
+        manager.flush()
+    }
+
     // Открыть (или вынести вперёд) отдельное окно настроек с вкладками.
     func showSettingsWindow() {
         closePopover()
@@ -617,21 +777,164 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
+
+    // Открыть окно «Просмотр базы данных» — таблица всех записей.
+    func showDatabaseWindow() {
+        closePopover()
+        if let databaseWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            databaseWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let hosting = NSHostingController(rootView: DatabaseView(manager: manager))
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "База данных"
+        window.styleMask = [.titled, .closable, .resizable]
+        window.isReleasedWhenClosed = false
+        window.setContentSize(NSSize(width: 720, height: 460))
+        window.center()
+        databaseWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+}
+
+// MARK: - Просмотр базы данных
+
+struct DatabaseView: View {
+    @ObservedObject var manager: ClipboardManager
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Всего записей: \(manager.history.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(8)
+            Divider()
+            Table(manager.history) {
+                TableColumn("Тип") { item in Text(typeLabel(item)) }
+                    .width(70)
+                TableColumn("Содержимое") { item in
+                    Text(contentLabel(item)).lineLimit(1)
+                }
+                TableColumn("Дата") { item in
+                    Text(item.date.formatted(date: .abbreviated, time: .shortened))
+                }
+                .width(150)
+                TableColumn("Список") { item in Text(item.listName ?? "—") }
+                    .width(90)
+                TableColumn("Источник") { item in Text(sourceLabel(item)) }
+                    .width(130)
+            }
+        }
+        .frame(minWidth: 600, minHeight: 400)
+    }
+
+    private func typeLabel(_ item: ClipboardItem) -> String {
+        switch item.kind {
+        case .text: return "Текст"
+        case .image: return "Картинка"
+        case .file: return "Файл"
+        }
+    }
+    private func contentLabel(_ item: ClipboardItem) -> String {
+        item.kind == .image ? "[изображение]" : (item.text ?? "")
+    }
+    private func sourceLabel(_ item: ClipboardItem) -> String {
+        guard let id = item.sourceBundleID else { return "—" }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+            return url.deletingPathExtension().lastPathComponent
+        }
+        return id
+    }
 }
 
 // MARK: - Фильтр панели (вкладки)
 
 enum HistoryFilter: Hashable {
     case all
-    case pinned
     case list(String)
+    // Встроенные умные списки (быстрые пресеты).
+    case smartText
+    case smartLinks
+    case smartImages
+    case smartToday
+    // Пользовательский умный список (по id).
+    case smart(UUID)
 
     var title: String {
         switch self {
         case .all: return "Все"
-        case .pinned: return "Закреплённые"
         case .list(let name): return name
+        case .smartText: return "Текст"
+        case .smartLinks: return "Ссылки"
+        case .smartImages: return "Изображения"
+        case .smartToday: return "Сегодня"
+        case .smart: return "Умный список"
         }
+    }
+}
+
+// Похоже ли содержимое записи на ссылку.
+func isLinkItem(_ item: ClipboardItem) -> Bool {
+    guard item.kind == .text, let t = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+    return t.hasPrefix("http://") || t.hasPrefix("https://") || t.contains("://")
+}
+
+// MARK: - Пользовательские умные списки (правила)
+
+struct SmartRule: Codable, Hashable, Identifiable {
+    enum Field: String, Codable, CaseIterable { case type, date, contains }
+    var id = UUID()
+    var field: Field
+    var value: String   // type: text/link/image/file; date: today/week; contains: подстрока
+}
+
+struct SmartList: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var name: String
+    var matchAll: Bool = true       // совпадает всем условиям / любому
+    var rules: [SmartRule] = []
+}
+
+func matches(_ item: ClipboardItem, rule: SmartRule) -> Bool {
+    switch rule.field {
+    case .type:
+        switch rule.value {
+        case "text":  return item.kind == .text && !isLinkItem(item)
+        case "link":  return isLinkItem(item)
+        case "image": return item.kind == .image
+        case "file":  return item.kind == .file
+        default:      return true
+        }
+    case .date:
+        switch rule.value {
+        case "today": return Calendar.current.isDateInToday(item.date)
+        case "week":
+            let weekAgo = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date()
+            return item.date >= weekAgo
+        default: return true
+        }
+    case .contains:
+        guard !rule.value.isEmpty else { return true }
+        return (item.text ?? "").localizedCaseInsensitiveContains(rule.value)
+    }
+}
+
+func matches(_ item: ClipboardItem, smart: SmartList) -> Bool {
+    guard !smart.rules.isEmpty else { return true }
+    let results = smart.rules.map { matches(item, rule: $0) }
+    return smart.matchAll ? results.allSatisfy { $0 } : results.contains(true)
+}
+
+func defaultRuleValue(for field: SmartRule.Field) -> String {
+    switch field {
+    case .type: return "text"
+    case .date: return "today"
+    case .contains: return ""
     }
 }
 
@@ -646,16 +949,37 @@ struct HistoryView: View {
     @State private var keyMonitor: Any?
     @State private var showAddList = false
     @State private var newListName = ""
+    @State private var smartEditor: SmartList?     // редактор умного списка
+    @State private var showAddClip = false
+    @State private var newClipText = ""
 
     @AppStorage("autoPaste") private var autoPaste = false
     @AppStorage("compactMode") private var compactMode = false
+    @AppStorage("hotkeyModifiers") private var hotkeyModifiers = cmdKey | shiftKey
+    @AppStorage("hotkeyKeyCode") private var hotkeyKeyCode = 9
+
+    // Текущее сочетание вызова панели в читаемом виде (для подсказки).
+    private var comboLabel: String {
+        let mod = hotkeyModifierOptions.first { $0.flags == hotkeyModifiers }?.name ?? ""
+        let key = hotkeyKeyOptions.first { $0.code == hotkeyKeyCode }?.name ?? ""
+        return mod + key
+    }
 
     private var filteredItems: [ClipboardItem] {
         var items = manager.history
         switch filter {
-        case .all: items = items.filter { !$0.isPinned }   // закреплённые — в своём списке
-        case .pinned: items = items.filter { $0.isPinned }
+        case .all: items = items.filter { $0.listName == nil }   // только записи без списка
         case .list(let name): items = items.filter { $0.listName == name }
+        case .smartText: items = items.filter { $0.kind == .text && !isLinkItem($0) }
+        case .smartLinks: items = items.filter { isLinkItem($0) }
+        case .smartImages: items = items.filter { $0.kind == .image }
+        case .smartToday: items = items.filter { Calendar.current.isDateInToday($0.date) }
+        case .smart(let id):
+            if let sl = manager.smartLists.first(where: { $0.id == id }) {
+                items = items.filter { matches($0, smart: sl) }
+            } else {
+                items = []
+            }
         }
         guard !searchText.isEmpty else { return items }
         return items.filter {
@@ -691,14 +1015,33 @@ struct HistoryView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
                     chip("Все", .all)
-                    chip("📌 Закреп", .pinned)
+                    // Встроенные умные списки (быстрые пресеты).
+                    chip("Текст", .smartText)
+                    chip("Ссылки", .smartLinks)
+                    chip("Изобр.", .smartImages)
+                    chip("Сегодня", .smartToday)
+                    Divider().frame(height: 16)
+                    // Обычные списки, включая 📌.
                     ForEach(manager.lists, id: \.self) { name in
                         chip(name, .list(name))
                     }
-                    // Плюсик: добавить список не заходя в настройки.
-                    Button {
-                        newListName = ""
-                        showAddList = true
+                    // Пользовательские умные списки (с иконкой-воронкой).
+                    ForEach(manager.smartLists) { sl in
+                        chip(sl.name, .smart(sl.id), icon: "line.3.horizontal.decrease.circle")
+                    }
+                    // Меню на «+»: что создать.
+                    Menu {
+                        Button("Обычный список") {
+                            newListName = ""
+                            showAddList = true
+                        }
+                        Button("Умный список") {
+                            smartEditor = SmartList(name: "", rules: [SmartRule(field: .type, value: "text")])
+                        }
+                        Button("Текстовый клип") {
+                            newClipText = ""
+                            showAddClip = true
+                        }
                     } label: {
                         Image(systemName: "plus")
                             .font(.caption)
@@ -706,8 +1049,10 @@ struct HistoryView: View {
                             .padding(.vertical, 4)
                             .background(.ultraThinMaterial, in: Capsule())
                     }
-                    .buttonStyle(.plain)
-                    .help("Новый список")
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("Создать")
                 }
                 .padding(.horizontal, 8)
             }
@@ -739,19 +1084,31 @@ struct HistoryView: View {
                             proxy.scrollTo(filteredItems[newIndex].id)
                         }
                     }
+                    .onChange(of: manager.openToken) { _, _ in
+                        // При каждом открытии панели возвращаемся к самой свежей записи.
+                        selectedIndex = 0
+                        if let first = filteredItems.first {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo(first.id, anchor: .top)
+                            }
+                        }
+                    }
                 }
             }
 
             Divider()
 
             HStack {
-                Text("⇧⌘V — открыть · ↑↓ Enter · Space — превью")
+                Text("\(comboLabel) — открыть · ↑↓ Enter · Space — превью")
                     .font(.caption2)
                     .foregroundColor(.secondary)
                 Spacer()
                 Menu {
                     Button("Настройки…") {
                         AppDelegate.shared?.showSettingsWindow()
+                    }
+                    Button("Просмотр базы данных") {
+                        AppDelegate.shared?.showDatabaseWindow()
                     }
                     Picker("Режим отображения", selection: $compactMode) {
                         Text("Подробный").tag(false)
@@ -787,6 +1144,14 @@ struct HistoryView: View {
             }
             Button("Отмена", role: .cancel) {}
         }
+        .alert("Новый текстовый клип", isPresented: $showAddClip) {
+            TextField("Текст", text: $newClipText)
+            Button("Добавить") { manager.addManualText(newClipText) }
+            Button("Отмена", role: .cancel) {}
+        }
+        .sheet(item: $smartEditor) { sl in
+            SmartListEditor(manager: manager, draft: sl)
+        }
         .onAppear { installKeyMonitor() }
         .onDisappear { removeKeyMonitor() }
         .onChange(of: searchText) { _, _ in selectedIndex = 0 }
@@ -795,22 +1160,27 @@ struct HistoryView: View {
 
     // Чип-кнопка фильтра. Подсвечивается, если выбран.
     @ViewBuilder
-    private func chip(_ title: String, _ value: HistoryFilter) -> some View {
+    private func chip(_ title: String, _ value: HistoryFilter, icon: String? = nil) -> some View {
         let isSelected = filter == value
         Button {
             filter = value
         } label: {
-            Text(title)
-                .font(.caption)
-                .lineLimit(1)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(
-                    isSelected ? AnyShapeStyle(Color.accentColor)
-                               : AnyShapeStyle(.ultraThinMaterial),
-                    in: Capsule()
-                )
-                .foregroundStyle(isSelected ? Color.white : Color.primary)
+            HStack(spacing: 3) {
+                if let icon {
+                    Image(systemName: icon).font(.caption2)
+                }
+                Text(title)
+                    .font(.caption)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                isSelected ? AnyShapeStyle(Color.accentColor)
+                           : AnyShapeStyle(.ultraThinMaterial),
+                in: Capsule()
+            )
+            .foregroundStyle(isSelected ? Color.white : Color.primary)
         }
         .buttonStyle(.plain)
     }
@@ -871,15 +1241,6 @@ struct HistoryView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-
-            Button {
-                manager.togglePin(item)
-            } label: {
-                Image(systemName: item.isPinned ? "pin.fill" : "pin")
-                    .foregroundColor(item.isPinned ? .orange : .secondary)
-            }
-            .buttonStyle(.plain)
-            .help(item.isPinned ? "Открепить" : "Закрепить")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, compactMode ? 6 : 9)
@@ -906,7 +1267,6 @@ struct HistoryView: View {
                 Button("Сохранить изображение…") { saveImage(item) }
             }
             Divider()
-            Button(item.isPinned ? "Открепить" : "Закрепить") { manager.togglePin(item) }
             Menu("Добавить в список") {
                 Button("Без списка") { manager.assign(item, toList: nil) }
                 ForEach(manager.lists, id: \.self) { name in
@@ -973,6 +1333,14 @@ struct HistoryView: View {
         case 53:  // Esc
             AppDelegate.shared?.closePopover()
             return true
+        case 51:  // ⌫ Delete — удалить выбранную запись (если не печатаем в поиске)
+            if !isTyping, items.indices.contains(selectedIndex) {
+                manager.delete(items[selectedIndex])
+                let newCount = filteredItems.count
+                selectedIndex = newCount == 0 ? 0 : min(selectedIndex, newCount - 1)
+                return true
+            }
+            return false
         case 49:  // Space — предпросмотр
             if !isTyping, items.indices.contains(selectedIndex) {
                 previewItem = items[selectedIndex]
@@ -1037,6 +1405,113 @@ struct PreviewView: View {
     }
 }
 
+// MARK: - Редактор умного списка
+
+struct SmartListEditor: View {
+    @ObservedObject var manager: ClipboardManager
+    @Environment(\.dismiss) private var dismiss
+    @State var draft: SmartList
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Умный список").font(.headline)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+            }
+
+            TextField("Название", text: $draft.name)
+                .textFieldStyle(.roundedBorder)
+
+            HStack(spacing: 6) {
+                Text("Совпадает")
+                Picker("", selection: $draft.matchAll) {
+                    Text("всем").tag(true)
+                    Text("любому").tag(false)
+                }
+                .labelsHidden()
+                .fixedSize()
+                Text("из условий:")
+                Spacer()
+            }
+
+            ForEach($draft.rules) { $rule in
+                HStack(spacing: 6) {
+                    Picker("", selection: $rule.field) {
+                        Text("Тип").tag(SmartRule.Field.type)
+                        Text("Дата").tag(SmartRule.Field.date)
+                        Text("Содержит").tag(SmartRule.Field.contains)
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                    .onChange(of: rule.field) { _, newField in
+                        $rule.value.wrappedValue = defaultRuleValue(for: newField)
+                    }
+
+                    ruleValueEditor($rule)
+                    Spacer()
+                    Button {
+                        draft.rules.removeAll { $0.id == rule.id }
+                    } label: {
+                        Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Button {
+                draft.rules.append(SmartRule(field: .type, value: "text"))
+            } label: {
+                Label("Добавить условие", systemImage: "plus")
+            }
+
+            Spacer()
+
+            HStack {
+                Spacer()
+                Button("Сохранить") {
+                    manager.saveSmartList(draft)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(draft.name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 440, height: 380)
+    }
+
+    @ViewBuilder
+    private func ruleValueEditor(_ rule: Binding<SmartRule>) -> some View {
+        switch rule.wrappedValue.field {
+        case .type:
+            Picker("", selection: rule.value) {
+                Text("текст").tag("text")
+                Text("ссылка").tag("link")
+                Text("картинка").tag("image")
+                Text("файл").tag("file")
+            }
+            .labelsHidden()
+            .fixedSize()
+        case .date:
+            Picker("", selection: rule.value) {
+                Text("сегодня").tag("today")
+                Text("за неделю").tag("week")
+            }
+            .labelsHidden()
+            .fixedSize()
+        case .contains:
+            TextField("текст", text: rule.value)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 150)
+        }
+    }
+}
+
 // MARK: - Настройки (отдельное окно с вкладками)
 
 struct SettingsView: View {
@@ -1052,6 +1527,8 @@ struct SettingsView: View {
                 .tabItem { Label("Вставка", systemImage: "doc.on.clipboard") }
             SoundSettingsTab()
                 .tabItem { Label("Звук", systemImage: "speaker.wave.2.fill") }
+            ShortcutsSettingsTab()
+                .tabItem { Label("Клавиши", systemImage: "keyboard") }
             ListsSettingsTab(manager: manager)
                 .tabItem { Label("Списки", systemImage: "list.bullet") }
             ExclusionsSettingsTab(manager: manager)
@@ -1059,7 +1536,7 @@ struct SettingsView: View {
             InfoSettingsTab()
                 .tabItem { Label("Информация", systemImage: "info.circle") }
         }
-        .frame(width: 480, height: 410)
+        .frame(width: 540, height: 420)
     }
 }
 
@@ -1194,35 +1671,156 @@ struct SoundSettingsTab: View {
 struct ListsSettingsTab: View {
     @ObservedObject var manager: ClipboardManager
     @State private var newListName = ""
+    @State private var smartEditor: SmartList?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Списки — перетащите за ☰, чтобы изменить порядок")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.top, 12)
+                .padding(.bottom, 4)
+
+            List {
+                Section("Обычные списки") {
+                    if manager.lists.isEmpty {
+                        Text("Пока нет списков").foregroundStyle(.secondary)
+                    }
+                    ForEach(manager.lists, id: \.self) { name in
+                        HStack {
+                            Image(systemName: "line.3.horizontal")
+                                .foregroundStyle(.tertiary)
+                            Text(name)
+                            Spacer()
+                            Button {
+                                manager.deleteList(name)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Удалить список (записи останутся)")
+                        }
+                    }
+                    .onMove(perform: manager.moveList)
+                }
+
+                Section("Умные списки") {
+                    if manager.smartLists.isEmpty {
+                        Text("Пока нет умных списков").foregroundStyle(.secondary)
+                    }
+                    ForEach(manager.smartLists) { sl in
+                        HStack {
+                            Image(systemName: "line.3.horizontal.decrease.circle")
+                                .foregroundStyle(.tertiary)
+                            Text(sl.name)
+                            Spacer()
+                            Button { smartEditor = sl } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Изменить")
+                            Button { manager.deleteSmartList(sl) } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Удалить умный список")
+                        }
+                    }
+                    Button {
+                        smartEditor = SmartList(name: "", rules: [SmartRule(field: .type, value: "text")])
+                    } label: {
+                        Label("Создать умный список", systemImage: "plus")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            HStack {
+                TextField("Новый список…", text: $newListName)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { addAndClear() }
+                Button("Добавить") { addAndClear() }
+                    .disabled(newListName.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding()
+        }
+        .sheet(item: $smartEditor) { sl in
+            SmartListEditor(manager: manager, draft: sl)
+        }
+    }
+
+    private func addAndClear() {
+        manager.addList(newListName)
+        newListName = ""
+    }
+}
+
+// Капсула с обозначением клавиши.
+struct KeyCap: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.system(.callout, design: .rounded).weight(.medium))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
+// Вкладка «Сочетания клавиш»: настройка вызова панели + справка.
+struct ShortcutsSettingsTab: View {
+    @AppStorage("hotkeyModifiers") private var hotkeyModifiers = cmdKey | shiftKey
+    @AppStorage("hotkeyKeyCode") private var hotkeyKeyCode = 9
+
+    private var currentCombo: String {
+        let mod = hotkeyModifierOptions.first { $0.flags == hotkeyModifiers }?.name ?? ""
+        let key = hotkeyKeyOptions.first { $0.code == hotkeyKeyCode }?.name ?? ""
+        return mod + key
+    }
+
+    private let panelRows: [(String, [String])] = [
+        ("Перемещение по списку", ["↑", "↓"]),
+        ("Вставить выбранную запись", ["↵"]),
+        ("Быстрая вставка", ["1", "…", "9"]),
+        ("Предпросмотр записи", ["Space"]),
+        ("Удалить запись", ["⌫"]),
+        ("Закрыть панель", ["esc"])
+    ]
 
     var body: some View {
         Form {
-            Section("Списки") {
-                if manager.lists.isEmpty {
-                    Text("Пока нет списков")
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(manager.lists, id: \.self) { name in
-                    HStack {
-                        Text(name)
-                        Spacer()
-                        Button {
-                            manager.deleteList(name)
-                        } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Удалить список (записи останутся)")
-                    }
-                }
+            Section {
+                Text("Настройте вызов панели и посмотрите сочетания внутри неё.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("Вызов панели") {
                 HStack {
-                    TextField("Новый список…", text: $newListName)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Добавить") {
-                        manager.addList(newListName)
-                        newListName = ""
+                    Text("Активировать панель")
+                    Spacer()
+                    KeyCap(text: currentCombo)
+                }
+                Picker("Модификаторы", selection: $hotkeyModifiers) {
+                    ForEach(hotkeyModifierOptions, id: \.flags) { Text($0.name).tag($0.flags) }
+                }
+                .onChange(of: hotkeyModifiers) { _, _ in AppDelegate.shared?.reregisterHotKey() }
+                Picker("Клавиша", selection: $hotkeyKeyCode) {
+                    ForEach(hotkeyKeyOptions, id: \.code) { Text($0.name).tag($0.code) }
+                }
+                .onChange(of: hotkeyKeyCode) { _, _ in AppDelegate.shared?.reregisterHotKey() }
+            }
+
+            Section("Внутри панели") {
+                ForEach(panelRows, id: \.0) { row in
+                    HStack {
+                        Text(row.0)
+                        Spacer()
+                        HStack(spacing: 4) {
+                            ForEach(row.1, id: \.self) { KeyCap(text: $0) }
+                        }
                     }
-                    .disabled(newListName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
         }
@@ -1302,8 +1900,12 @@ struct ExclusionsSettingsTab: View {
     }
 }
 
-// Вкладка «Информация»: о проекте и ссылка на GitHub.
+// Вкладка «Информация»: о проекте, ссылка на GitHub и проверка обновлений.
 struct InfoSettingsTab: View {
+    @State private var updateStatus: String?
+    @State private var updateAvailable = false
+    @State private var checking = false
+
     private var version: String {
         let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
         let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
@@ -1326,9 +1928,50 @@ struct InfoSettingsTab: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal)
-            Link("Открыть на GitHub",
-                 destination: URL(string: "https://github.com/Cloncher-code/ClipboardHistory")!)
-                .buttonStyle(.borderedProminent)
+
+            // Проверка обновлений через GitHub Releases.
+            Button {
+                Task {
+                    checking = true
+                    updateStatus = nil
+                    updateAvailable = false
+                    switch await UpdateChecker.check() {
+                    case .newer(let tag):
+                        updateStatus = "Доступна новая версия: \(tag)"
+                        updateAvailable = true
+                    case .upToDate:
+                        updateStatus = "У вас последняя версия"
+                    case .noReleases:
+                        updateStatus = "На GitHub пока нет опубликованных релизов"
+                    case .failed(let why):
+                        updateStatus = "Не удалось проверить: \(why)"
+                    }
+                    checking = false
+                }
+            } label: {
+                if checking {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Проверить обновления")
+                }
+            }
+            .disabled(checking)
+
+            if let updateStatus {
+                Text(updateStatus)
+                    .font(.caption)
+                    .foregroundStyle(updateAvailable ? .orange : .secondary)
+            }
+
+            HStack(spacing: 10) {
+                Link("Открыть на GitHub",
+                     destination: URL(string: UpdateChecker.repo)!)
+                    .buttonStyle(.borderedProminent)
+                if updateAvailable {
+                    Link("Скачать обновление",
+                         destination: URL(string: UpdateChecker.repo + "/releases")!)
+                }
+            }
             Spacer()
         }
         .padding(20)
