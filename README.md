@@ -5,7 +5,7 @@
 ## Установка 
 
 
-1. Скачайте [ClipboardHistory.zip](https://github.com/Cloncher-code/ClipboardHistory/releases/download/ClipboardHistory/ClipboardHistory.zip) и распакуйте. 
+1. Скачайте [ClipboardHistory_v1_2.zip](https://github.com/Cloncher-code/ClipboardHistory/releases/download/v1.2/ClipboardHistory_v1_2.app.zip) и распакуйте. 
 2. Перетащите ClipboardHistory.app в папку «Программы».
 3. Кликните по приложению правой кнопкой → Открыть, затем в окне предупреждения ещё раз Открыть. (Обычный двойной клик на первый раз не сработает — это защита macOS для приложений не из App Store.)
 4. Если macOS всё равно не пускает: Системные настройки → Конфиденциальность и безопасность, пролистайте вниз до сообщения о ClipboardHistory и нажмите «Всё равно открыть».
@@ -29,4 +29,4 @@
 
 ## Последний релиз
 
-- Версия 1.0 (https://github.com/Cloncher-code/ClipboardHistory/releases/tag/ClipboardHistory)
+- Версия 1.2 (https://github.com/Cloncher-code/ClipboardHistory/releases/download/v1.2/ClipboardHistory_v1_2.app.zip)
