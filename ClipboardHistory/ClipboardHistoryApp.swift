@@ -4,6 +4,7 @@ import AppKit
 import Carbon               // глобальный хоткей
 import ServiceManagement    // автозапуск
 import CryptoKit            // хеши картинок
+import UniformTypeIdentifiers   // drag & drop записей в списки
 
 // MARK: - Модель
 
@@ -25,6 +26,7 @@ struct ClipboardItem: Identifiable, Codable, Equatable {
     var isPinned = false
     var listName: String?        // в каком пользовательском списке лежит запись
     var sourceBundleID: String?  // приложение, из которого скопировали (для иконки)
+    var isSensitive: Bool?       // пароль/секрет: маскируется в интерфейсе (nil = обычная)
 
     static func text(_ text: String, rtfFilename: String?) -> ClipboardItem {
         ClipboardItem(kind: .text, text: text, imageFilename: nil, imageHash: nil,
@@ -105,6 +107,53 @@ enum Sounds {
     }
 }
 
+// MARK: - Размер окна панели (пресеты)
+enum PanelSize: String, CaseIterable {
+    case small, medium, large
+
+    var size: CGSize {
+        switch self {
+        case .small:  return CGSize(width: 300, height: 440)
+        case .medium: return CGSize(width: 360, height: 520)
+        case .large:  return CGSize(width: 440, height: 640)
+        }
+    }
+    var title: String {
+        switch self {
+        case .small:  return "Маленький"
+        case .medium: return "Средний"
+        case .large:  return "Большой"
+        }
+    }
+    // Текущий выбор из настроек (для кода вне SwiftUI).
+    static var current: PanelSize {
+        PanelSize(rawValue: UserDefaults.standard.string(forKey: "panelSize") ?? "medium") ?? .medium
+    }
+}
+
+// MARK: - Расположение окна панели
+enum PanelPosition: String, CaseIterable {
+    case underIcon, topRight, topLeft, bottomRight, bottomLeft
+    case dockRight, dockLeft   // док у края экрана во всю высоту
+
+    var title: String {
+        switch self {
+        case .underIcon:   return "Под иконкой"
+        case .topRight:    return "Справа сверху"
+        case .topLeft:     return "Слева сверху"
+        case .bottomRight: return "Справа снизу"
+        case .bottomLeft:  return "Слева снизу"
+        case .dockRight:   return "Док справа (вся высота)"
+        case .dockLeft:    return "Док слева (вся высота)"
+        }
+    }
+    var isDock: Bool { self == .dockRight || self == .dockLeft }
+
+    static var current: PanelPosition {
+        PanelPosition(rawValue: UserDefaults.standard.string(forKey: "panelPosition") ?? "topRight") ?? .topRight
+    }
+}
+
 // MARK: - Опции для настройки глобального хоткея
 struct ModifierOption: Hashable { let name: String; let flags: Int }
 let hotkeyModifierOptions: [ModifierOption] = [
@@ -129,7 +178,8 @@ enum UpdateOutcome {
 
 enum UpdateChecker {
     static let repo = "https://github.com/Cloncher-code/ClipboardHistory"
-    static let api = "https://api.github.com/repos/Cloncher-code/ClipboardHistory/releases/latest"
+    // Список релизов (включает пре-релизы), а не releases/latest, который их пропускает.
+    static let api = "https://api.github.com/repos/Cloncher-code/ClipboardHistory/releases?per_page=10"
 
     static func check() async -> UpdateOutcome {
         guard let url = URL(string: api) else { return .failed("Неверный адрес") }
@@ -140,11 +190,15 @@ enum UpdateChecker {
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 404 { return .noReleases }              // релизов ещё нет
+            if code == 403 { return .failed("GitHub временно ограничил запросы, попробуйте позже") }
             guard code == 200 else { return .failed("Код ответа \(code)") }
-            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = obj["tag_name"] as? String else {
+            guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
                 return .failed("Не удалось разобрать ответ")
+            }
+            // Самый свежий релиз (включая пре-релизы), но не черновик.
+            guard let latest = arr.first(where: { ($0["draft"] as? Bool) != true }),
+                  let tag = latest["tag_name"] as? String else {
+                return .noReleases
             }
             let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0"
             return isNewer(tag, than: current) ? .newer(tag) : .upToDate
@@ -182,10 +236,17 @@ class ClipboardManager: ObservableObject {
     @Published var smartLists: [SmartList] = [] {
         didSet { saveSmartLists() }
     }
+    @Published var snippets: [Snippet] = [] {
+        didSet { saveSnippets() }
+    }
     @Published var excludedApps: [String] = [] {   // bundle ID приложений-исключений
         didSet { UserDefaults.standard.set(excludedApps, forKey: "excludedApps") }
     }
     @Published var openToken = 0   // меняется при каждом открытии панели (для прокрутки вверх)
+    @Published var dockHeight: CGFloat = 600   // актуальная высота панели в режиме дока
+    @Published var isPaused = false {   // пауза записи буфера (приватность)
+        didSet { AppDelegate.shared?.updateStatusIcon() }
+    }
 
     private var timer: Timer?
     private var cleanupTimer: Timer?
@@ -203,12 +264,32 @@ class ClipboardManager: ObservableObject {
     private var cleanupDays: Int     { UserDefaults.standard.integer(forKey: "cleanupDays") }
     private var captureSoundName: String { UserDefaults.standard.string(forKey: "captureSoundName") ?? "Tink" }
     private var historySoundName: String { UserDefaults.standard.string(forKey: "historySoundName") ?? "Pop" }
+    private var hidePasswordLike: Bool { UserDefaults.standard.bool(forKey: "hidePasswordLike") }
 
-    private let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+    // Маркеры «скрытого» содержимого от менеджеров паролей и т.п.
+    private let concealedTypes: [NSPasteboard.PasteboardType] = [
+        NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"),   // стандарт nspasteboard.org
+        NSPasteboard.PasteboardType("com.agilebits.onepassword"),        // 1Password
+        NSPasteboard.PasteboardType("com.apple.security.password")       // некоторые системные поля
+    ]
     private let alwaysIgnoredTypes: [NSPasteboard.PasteboardType] = [
         NSPasteboard.PasteboardType("org.nspasteboard.TransientType"),
         NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
     ]
+
+    // Грубая эвристика «похоже на пароль»: одно слово без пробелов,
+    // 8–64 символа, с буквами и цифрами (или спецсимволами / разным регистром).
+    private func looksLikePassword(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.count >= 8, t.count <= 64 else { return false }
+        guard !t.contains(where: { $0 == " " || $0 == "\n" || $0 == "\t" }) else { return false }
+        let hasLetter = t.contains { $0.isLetter }
+        let hasDigit  = t.contains { $0.isNumber }
+        let hasSymbol = t.contains { !$0.isLetter && !$0.isNumber }
+        let hasUpper  = t.contains { $0.isUppercase }
+        let hasLower  = t.contains { $0.isLowercase }
+        return hasLetter && hasDigit && (hasSymbol || (hasUpper && hasLower))
+    }
 
     // Папка для вложений: ~/Library/.../Application Support/ClipboardHistory/Files
     private let attachmentsDirectory: URL = {
@@ -231,6 +312,9 @@ class ClipboardManager: ObservableObject {
             "captureSoundName": "Tink",
             "historySoundName": "Pop",
             "compactMode": false,
+            "panelSize": "medium",
+            "panelPosition": "topRight",
+            "hidePasswordLike": false,
             "hotkeyKeyCode": 9,                    // V
             "hotkeyModifiers": cmdKey | shiftKey   // ⇧⌘
         ])
@@ -238,6 +322,7 @@ class ClipboardManager: ObservableObject {
         load()
         loadLists()
         loadSmartLists()
+        loadSnippets()
         // 📌 — обычный список, существующий по умолчанию (бывшее «закрепление»).
         if !lists.contains("📌") { lists.insert("📌", at: 0) }
         excludedApps = UserDefaults.standard.stringArray(forKey: "excludedApps") ?? []
@@ -260,10 +345,40 @@ class ClipboardManager: ObservableObject {
         guard pasteboard.changeCount != lastChangeCount else { return }
         lastChangeCount = pasteboard.changeCount
 
+        // Пауза записи: изменения буфера игнорируются (но счётчик обновляем,
+        // чтобы после снятия паузы не подхватить старое).
+        if isPaused { return }
+
         let types = pasteboard.types ?? []
 
-        if types.contains(where: { alwaysIgnoredTypes.contains($0) }) { return }
-        if !savePasswords && types.contains(concealedType) { return }
+        // ЛОГИКА БЕЗОПАСНОСТИ.
+        // Менеджеры паролей помечают пароль сразу двумя метками:
+        // «скрытое» (Concealed) и «временное» (Transient). Поэтому порядок важен:
+        // сначала решаем судьбу скрытого содержимого, и только потом
+        // отбрасываем прочее временное/автогенерированное.
+        let isConcealed = types.contains(where: { concealedTypes.contains($0) })
+        let isTransient = types.contains(where: { alwaysIgnoredTypes.contains($0) })
+
+        var sensitive = false
+        if isConcealed {
+            if savePasswords {
+                sensitive = true          // сохраняем, но помечаем и маскируем
+            } else {
+                return                    // пароли выключены — не записываем
+            }
+        } else if isTransient {
+            return                        // временное (не пароль) не записываем никогда
+        }
+
+        // Эвристика «похоже на пароль» (для приложений без меток).
+        if !sensitive, hidePasswordLike,
+           let s = pasteboard.string(forType: .string), looksLikePassword(s) {
+            if savePasswords {
+                sensitive = true
+            } else {
+                return
+            }
+        }
 
         // Приложение, из которого только что скопировали (для иконки записи).
         let source = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
@@ -282,7 +397,8 @@ class ClipboardManager: ObservableObject {
             added = addImage(pngData, source: source)
         } else if let text = pasteboard.string(forType: .string) {
             // Если есть форматированная версия — сохраняем и её.
-            added = addText(text, rtfData: pasteboard.data(forType: .rtf), source: source)
+            added = addText(text, rtfData: pasteboard.data(forType: .rtf),
+                            source: source, sensitive: sensitive)
         }
 
         if added && soundOnCapture {
@@ -291,7 +407,7 @@ class ClipboardManager: ObservableObject {
     }
 
     @discardableResult
-    private func addText(_ text: String, rtfData: Data?, source: String?) -> Bool {
+    private func addText(_ text: String, rtfData: Data?, source: String?, sensitive: Bool = false) -> Bool {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
 
         // Дубликат: сохраняем пин и список, убираем старую запись (и её RTF-файл).
@@ -311,6 +427,7 @@ class ClipboardManager: ObservableObject {
         item.isPinned = old?.isPinned ?? false
         item.listName = old?.listName
         item.sourceBundleID = source
+        item.isSensitive = sensitive ? true : nil
         history.insert(item, at: 0)
         trimHistory()
         return true
@@ -370,6 +487,12 @@ class ClipboardManager: ObservableObject {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
 
+        // Пароль: помечаем буфер «скрытым», чтобы другие менеджеры буфера
+        // (и мы сами при повторном опросе) не записали его содержимое.
+        if item.isSensitive == true {
+            pasteboard.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        }
+
         switch item.kind {
         case .text:
             // Сначала RTF (если есть и не включён режим «без форматирования»),
@@ -403,6 +526,17 @@ class ClipboardManager: ObservableObject {
         guard let filename = item.imageFilename else { return nil }
         let url = attachmentsDirectory.appendingPathComponent(filename)
         return ImageCache.image(at: url, key: filename)
+    }
+
+    // Копировать несколько записей сразу: их текст объединяется через перенос строки.
+    func copyCombined(_ items: [ClipboardItem]) {
+        let text = items.compactMap { $0.text }.joined(separator: "\n")
+        guard !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        lastChangeCount = pasteboard.changeCount
+        if playSound { Sounds.play(historySoundName) }
     }
 
     // PNG-данные картинки на диске (для «Сохранить изображение»).
@@ -480,6 +614,17 @@ class ClipboardManager: ObservableObject {
         }
     }
 
+    func renameList(_ oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !lists.contains(trimmed),
+              let i = lists.firstIndex(of: oldName) else { return }
+        lists[i] = trimmed
+        // Переносим записи в переименованный список.
+        for index in history.indices where history[index].listName == oldName {
+            history[index].listName = trimmed
+        }
+    }
+
     func moveList(from source: IndexSet, to destination: Int) {
         lists.move(fromOffsets: source, toOffset: destination)
     }
@@ -513,6 +658,62 @@ class ClipboardManager: ObservableObject {
            let saved = try? JSONDecoder().decode([SmartList].self, from: data) {
             smartLists = saved
         }
+    }
+
+    // MARK: Сниппеты
+
+    func saveSnippet(_ s: Snippet) {
+        if let i = snippets.firstIndex(where: { $0.id == s.id }) {
+            snippets[i] = s
+        } else {
+            snippets.append(s)
+        }
+    }
+    func deleteSnippet(_ s: Snippet) {
+        snippets.removeAll { $0.id == s.id }
+    }
+    // Положить произвольный текст в буфер (для вставки сниппета).
+    func copyText(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        lastChangeCount = pasteboard.changeCount
+        if playSound { Sounds.play(historySoundName) }
+    }
+    private func saveSnippets() {
+        if let data = try? JSONEncoder().encode(snippets) {
+            UserDefaults.standard.set(data, forKey: "snippets")
+        }
+    }
+    private func loadSnippets() {
+        if let data = UserDefaults.standard.data(forKey: "snippets"),
+           let saved = try? JSONDecoder().decode([Snippet].self, from: data) {
+            snippets = saved
+        }
+    }
+
+    // MARK: Резервная копия
+
+    func exportBackup() -> Data? {
+        let backup = BackupData(history: history, lists: lists,
+                                smartLists: smartLists, snippets: snippets,
+                                excludedApps: excludedApps)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .prettyPrinted
+        return try? encoder.encode(backup)
+    }
+
+    @discardableResult
+    func importBackup(_ data: Data) -> Bool {
+        guard let backup = try? JSONDecoder().decode(BackupData.self, from: data) else { return false }
+        history = backup.history
+        lists = backup.lists
+        if !lists.contains("📌") { lists.insert("📌", at: 0) }
+        smartLists = backup.smartLists
+        snippets = backup.snippets
+        excludedApps = backup.excludedApps
+        flush()
+        return true
     }
 
     // MARK: Исключения
@@ -675,12 +876,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.setContentSize(NSSize(width: 340, height: 480))
+        panel.setContentSize(PanelSize.current.size)
 
         // Глобальный хоткей ⇧⌘V — работает из любого приложения.
         hotKey = HotKeyManager { [weak self] in
             self?.togglePopover()
         }
+
+        // Первый запуск — показываем приветствие один раз.
+        if !UserDefaults.standard.bool(forKey: "onboardingShown") {
+            DispatchQueue.main.async { [weak self] in
+                self?.showOnboardingWindow()
+            }
+        }
+    }
+
+    private var onboardingWindow: NSWindow?
+
+    func showOnboardingWindow() {
+        if let onboardingWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            onboardingWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let hosting = NSHostingController(rootView: OnboardingView {
+            UserDefaults.standard.set(true, forKey: "onboardingShown")
+            self.onboardingWindow?.close()
+        })
+        let window = NSWindow(contentViewController: hosting)
+        window.title = "Добро пожаловать"
+        window.styleMask = [.titled, .closable]
+        window.isReleasedWhenClosed = false
+        window.setContentSize(NSSize(width: 460, height: 520))
+        window.center()
+        onboardingWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     @objc func togglePopover() {
@@ -690,7 +921,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Запоминаем активное приложение — в него потом будем вставлять.
             previousApp = NSWorkspace.shared.frontmostApplication
             manager.openToken += 1   // сигнал панели прокрутиться вверх
-            positionPanel()
+            applyPanelLayout()       // размер и позиция (учитывает режим дока)
             // orderFrontRegardless показывает панель БЕЗ активации приложения,
             // поэтому из полноэкранного режима нас не выкидывает.
             panel.orderFrontRegardless()
@@ -707,23 +938,74 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Ставим панель под иконкой меню-бара (или по центру сверху, если иконка скрыта).
-    private func positionPanel() {
+    // Ставим панель по выбранному расположению на экране с курсором.
+    private func targetScreen() -> NSScreen? {
+        let mouse = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouse) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
+    // Единый пересчёт размера и позиции панели (учитывает режим дока).
+    func applyPanelLayout() {
+        let screen = targetScreen()
+        let visible = screen?.visibleFrame ?? .zero
+        let margin: CGFloat = 8
+        let pos = PanelPosition.current
+        let width = PanelSize.current.size.width
+
+        let size: NSSize
+        if pos.isDock {
+            size = NSSize(width: width, height: visible.height - margin * 2)  // вся высота
+        } else {
+            size = PanelSize.current.size
+        }
+        panel.setContentSize(size)
+        manager.dockHeight = size.height   // чтобы SwiftUI-контент совпал по высоте
+        positionPanel(on: screen)
+    }
+
+    private func positionPanel(on screen: NSScreen?) {
         let size = panel.frame.size
-        let screen = NSScreen.main ?? NSScreen.screens.first
+        let margin: CGFloat = 8
         let visible = screen?.visibleFrame ?? .zero
 
         var origin: NSPoint
-        if let buttonWindow = statusItem.button?.window {
-            let b = buttonWindow.frame
-            origin = NSPoint(x: b.midX - size.width / 2, y: b.minY - size.height - 4)
-        } else {
-            origin = NSPoint(x: visible.midX - size.width / 2,
-                             y: visible.maxY - size.height - 8)
+        switch PanelPosition.current {
+        case .underIcon:
+            // Под иконкой — только если её окно на том же экране, что и курсор.
+            if let buttonWindow = statusItem.button?.window,
+               let screen,
+               screen.frame.contains(NSPoint(x: buttonWindow.frame.midX,
+                                             y: buttonWindow.frame.midY)) {
+                let b = buttonWindow.frame
+                origin = NSPoint(x: b.midX - size.width / 2, y: b.minY - size.height - 4)
+            } else {
+                origin = NSPoint(x: visible.midX - size.width / 2,
+                                 y: visible.maxY - size.height - margin)
+            }
+        case .topRight:
+            origin = NSPoint(x: visible.maxX - size.width - margin,
+                             y: visible.maxY - size.height - margin)
+        case .topLeft:
+            origin = NSPoint(x: visible.minX + margin,
+                             y: visible.maxY - size.height - margin)
+        case .bottomRight:
+            origin = NSPoint(x: visible.maxX - size.width - margin,
+                             y: visible.minY + margin)
+        case .bottomLeft:
+            origin = NSPoint(x: visible.minX + margin,
+                             y: visible.minY + margin)
+        case .dockRight:
+            origin = NSPoint(x: visible.maxX - size.width - margin,
+                             y: visible.minY + margin)
+        case .dockLeft:
+            origin = NSPoint(x: visible.minX + margin,
+                             y: visible.minY + margin)
         }
-        // Не вылезать за края экрана.
-        origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - size.width - 8))
-        origin.y = max(visible.minY + 8, min(origin.y, visible.maxY - size.height - 8))
+        // Не вылезать за края выбранного экрана.
+        origin.x = max(visible.minX + margin, min(origin.x, visible.maxX - size.width - margin))
+        origin.y = max(visible.minY + margin, min(origin.y, visible.maxY - size.height - margin))
         panel.setFrameOrigin(origin)
     }
 
@@ -748,6 +1030,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // Перепривязать глобальный хоткей после изменения в настройках.
     func reregisterHotKey() {
         hotKey?.register()
+    }
+
+    // Иконка в меню-баре: обычная или «пауза».
+    func updateStatusIcon() {
+        let name = manager.isPaused ? "pause.circle" : "doc.on.clipboard"
+        statusItem.button?.image = NSImage(systemSymbolName: name,
+                                           accessibilityDescription: "История буфера")
+    }
+
+    // Сменить размер/позицию панели на лету (из настроек/меню).
+    func resizePanel() {
+        applyPanelLayout()
     }
 
     // Гарантированно сохраняем историю при выходе (на случай отложенной записи).
@@ -841,7 +1135,8 @@ struct DatabaseView: View {
         }
     }
     private func contentLabel(_ item: ClipboardItem) -> String {
-        item.kind == .image ? "[изображение]" : (item.text ?? "")
+        if item.isSensitive == true { return "•••••••• (пароль)" }
+        return item.kind == .image ? "[изображение]" : (item.text ?? "")
     }
     private func sourceLabel(_ item: ClipboardItem) -> String {
         guard let id = item.sourceBundleID else { return "—" }
@@ -864,6 +1159,8 @@ enum HistoryFilter: Hashable {
     case smartToday
     // Пользовательский умный список (по id).
     case smart(UUID)
+    // Текстовые заготовки (отдельный экран, не история).
+    case snippets
 
     var title: String {
         switch self {
@@ -874,6 +1171,7 @@ enum HistoryFilter: Hashable {
         case .smartImages: return "Изображения"
         case .smartToday: return "Сегодня"
         case .smart: return "Умный список"
+        case .snippets: return "Заготовки"
         }
     }
 }
@@ -882,6 +1180,48 @@ enum HistoryFilter: Hashable {
 func isLinkItem(_ item: ClipboardItem) -> Bool {
     guard item.kind == .text, let t = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
     return t.hasPrefix("http://") || t.hasPrefix("https://") || t.contains("://")
+}
+
+// MARK: - Распознавание типа контента
+
+enum ContentType {
+    case color(NSColor)
+    case email
+    case link
+    case plain
+}
+
+// Hex-цвет вида #RGB / #RRGGBB / #RRGGBBAA.
+func hexColor(_ s: String) -> NSColor? {
+    guard s.hasPrefix("#") else { return nil }
+    var str = String(s.dropFirst())
+    guard [3, 6, 8].contains(str.count), str.allSatisfy({ $0.isHexDigit }) else { return nil }
+    if str.count == 3 { str = str.map { "\($0)\($0)" }.joined() }
+    var value: UInt64 = 0
+    Scanner(string: str).scanHexInt64(&value)
+    let r, g, b, a: CGFloat
+    if str.count == 8 {
+        r = CGFloat((value >> 24) & 0xFF) / 255; g = CGFloat((value >> 16) & 0xFF) / 255
+        b = CGFloat((value >> 8) & 0xFF) / 255;  a = CGFloat(value & 0xFF) / 255
+    } else {
+        r = CGFloat((value >> 16) & 0xFF) / 255; g = CGFloat((value >> 8) & 0xFF) / 255
+        b = CGFloat(value & 0xFF) / 255;         a = 1
+    }
+    return NSColor(red: r, green: g, blue: b, alpha: a)
+}
+
+func isEmail(_ s: String) -> Bool {
+    let pattern = "^[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}$"
+    return s.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+}
+
+func detectContentType(_ item: ClipboardItem) -> ContentType {
+    guard item.kind == .text,
+          let raw = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return .plain }
+    if let color = hexColor(raw) { return .color(color) }
+    if isLinkItem(item) { return .link }
+    if isEmail(raw) { return .email }
+    return .plain
 }
 
 // MARK: - Пользовательские умные списки (правила)
@@ -898,6 +1238,22 @@ struct SmartList: Codable, Hashable, Identifiable {
     var name: String
     var matchAll: Bool = true       // совпадает всем условиям / любому
     var rules: [SmartRule] = []
+}
+
+// Текстовая заготовка (сниппет) — постоянный шаблон, не вытесняется историей.
+struct Snippet: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var title: String
+    var text: String
+}
+
+// Резервная копия всех пользовательских данных.
+struct BackupData: Codable {
+    var history: [ClipboardItem]
+    var lists: [String]
+    var smartLists: [SmartList]
+    var snippets: [Snippet]
+    var excludedApps: [String]
 }
 
 func matches(_ item: ClipboardItem, rule: SmartRule) -> Bool {
@@ -938,6 +1294,43 @@ func defaultRuleValue(for field: SmartRule.Field) -> String {
     }
 }
 
+// MARK: - Приём перетаскивания записи на чип списка
+
+struct ChipDropModifier: ViewModifier {
+    // target: nil — чип не принимает дроп; .some(nil) — убрать из списка («Все»);
+    // .some(имя) — назначить в этот список.
+    let target: String??
+    let manager: ClipboardManager
+    @State private var isTargeted = false
+
+    func body(content: Content) -> some View {
+        if let target {
+            content
+                .overlay(
+                    Capsule().strokeBorder(Color.accentColor,
+                                           lineWidth: isTargeted ? 2 : 0)
+                )
+                .onDrop(of: [UTType.plainText], isTargeted: $isTargeted) { providers in
+                    guard let provider = providers.first else { return false }
+                    _ = provider.loadObject(ofClass: NSString.self) { object, _ in
+                        guard let str = object as? String else { return }
+                        let ids = str.split(separator: ",").compactMap { UUID(uuidString: String($0)) }
+                        DispatchQueue.main.async {
+                            for id in ids {
+                                if let item = manager.history.first(where: { $0.id == id }) {
+                                    manager.assign(item, toList: target)
+                                }
+                            }
+                        }
+                    }
+                    return true
+                }
+        } else {
+            content
+        }
+    }
+}
+
 // MARK: - Панель истории
 
 struct HistoryView: View {
@@ -950,11 +1343,17 @@ struct HistoryView: View {
     @State private var showAddList = false
     @State private var newListName = ""
     @State private var smartEditor: SmartList?     // редактор умного списка
+    @State private var snippetEditor: Snippet?     // редактор заготовки
     @State private var showAddClip = false
     @State private var newClipText = ""
+    @State private var selected = Set<UUID>()        // выделенные записи (клик / ⌘-клик)
+    @State private var lastTapID: UUID?              // для ручного определения двойного клика
+    @State private var lastTapTime: Date = .distantPast
 
     @AppStorage("autoPaste") private var autoPaste = false
     @AppStorage("compactMode") private var compactMode = false
+    @AppStorage("panelSize") private var panelSize: PanelSize = .medium
+    @AppStorage("panelPosition") private var panelPosition: PanelPosition = .topRight
     @AppStorage("hotkeyModifiers") private var hotkeyModifiers = cmdKey | shiftKey
     @AppStorage("hotkeyKeyCode") private var hotkeyKeyCode = 9
 
@@ -980,9 +1379,12 @@ struct HistoryView: View {
             } else {
                 items = []
             }
+        case .snippets:
+            items = []   // заготовки — не история, показываются отдельным экраном
         }
         guard !searchText.isEmpty else { return items }
         return items.filter {
+            $0.isSensitive != true &&
             ($0.text ?? "").localizedCaseInsensitiveContains(searchText)
         }
     }
@@ -1029,6 +1431,8 @@ struct HistoryView: View {
                     ForEach(manager.smartLists) { sl in
                         chip(sl.name, .smart(sl.id), icon: "line.3.horizontal.decrease.circle")
                     }
+                    // Заготовки — отдельный экран.
+                    chip("Заготовки", .snippets, icon: "text.badge.star")
                     // Меню на «+»: что создать.
                     Menu {
                         Button("Обычный список") {
@@ -1037,6 +1441,9 @@ struct HistoryView: View {
                         }
                         Button("Умный список") {
                             smartEditor = SmartList(name: "", rules: [SmartRule(field: .type, value: "text")])
+                        }
+                        Button("Заготовку") {
+                            snippetEditor = Snippet(title: "", text: "")
                         }
                         Button("Текстовый клип") {
                             newClipText = ""
@@ -1060,7 +1467,9 @@ struct HistoryView: View {
 
             Divider()
 
-            if filteredItems.isEmpty {
+            if filter == .snippets {
+                snippetsList
+            } else if filteredItems.isEmpty {
                 Text(searchText.isEmpty
                      ? "Здесь пусто.\nСкопируйте что-нибудь (⌘C)!"
                      : "Ничего не найдено")
@@ -1070,23 +1479,29 @@ struct HistoryView: View {
                     .padding(30)
             } else {
                 ScrollViewReader { proxy in
-                    List(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
-                        rowView(item: item, index: index)
-                            .id(item.id)
-                            .listRowBackground(Color.clear)   // строки прозрачные — видно стекло
-                            .listRowSeparator(.hidden)        // свои карточки вместо линий
-                            .listRowInsets(EdgeInsets(top: 3, leading: 8, bottom: 3, trailing: 8))
+                    // ScrollView вместо List: у List (таблица AppKit под капотом)
+                    // своя прямоугольная подсветка строки при правом клике,
+                    // которая не совпадает с нашими скруглёнными карточками.
+                    ScrollView {
+                        LazyVStack(spacing: 6) {
+                            ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
+                                rowView(item: item, index: index)
+                                    .id(item.id)
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
                     }
-                    .listStyle(.plain)
-                    .scrollContentBackground(.hidden)         // убираем белый фон списка
                     .onChange(of: selectedIndex) { _, newIndex in
                         if filteredItems.indices.contains(newIndex) {
                             proxy.scrollTo(filteredItems[newIndex].id)
                         }
                     }
                     .onChange(of: manager.openToken) { _, _ in
-                        // При каждом открытии панели возвращаемся к самой свежей записи.
+                        // При каждом открытии панели возвращаемся к самой свежей записи
+                        // и сбрасываем мультивыбор.
                         selectedIndex = 0
+                        selected.removeAll()
                         if let first = filteredItems.first {
                             DispatchQueue.main.async {
                                 proxy.scrollTo(first.id, anchor: .top)
@@ -1099,11 +1514,19 @@ struct HistoryView: View {
             Divider()
 
             HStack {
-                Text("\(comboLabel) — открыть · ↑↓ Enter · Space — превью")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                Spacer()
+                if selected.count > 1 {
+                    Button("Скопировать (\(selected.count))") { copySelected() }
+                    Button("Сброс") { selected.removeAll() }
+                    Spacer()
+                } else {
+                    Text("\(comboLabel) — открыть · ⌘клик — мультивыбор")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
                 Menu {
+                    Toggle("Пауза записи", isOn: $manager.isPaused)
+                    Divider()
                     Button("Настройки…") {
                         AppDelegate.shared?.showSettingsWindow()
                     }
@@ -1113,6 +1536,16 @@ struct HistoryView: View {
                     Picker("Режим отображения", selection: $compactMode) {
                         Text("Подробный").tag(false)
                         Text("Краткий").tag(true)
+                    }
+                    Picker("Размер окна", selection: $panelSize) {
+                        ForEach(PanelSize.allCases, id: \.self) { size in
+                            Text(size.title).tag(size)
+                        }
+                    }
+                    Picker("Расположение", selection: $panelPosition) {
+                        ForEach(PanelPosition.allCases, id: \.self) { pos in
+                            Text(pos.title).tag(pos)
+                        }
                     }
                     Divider()
                     Button("Очистить историю") { manager.clearHistory() }
@@ -1128,10 +1561,13 @@ struct HistoryView: View {
             }
             .padding(8)
         }
-        .frame(width: 340, height: 480)
+        .frame(width: panelSize.size.width,
+               height: panelPosition.isDock ? manager.dockHeight : panelSize.size.height)
         // Матовое стекло вместо плоского фона — основной приём оформления macOS 26.
         .background(.regularMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .onChange(of: panelSize) { _, _ in AppDelegate.shared?.resizePanel() }
+        .onChange(of: panelPosition) { _, _ in AppDelegate.shared?.resizePanel() }
         .sheet(item: $previewItem) { item in
             PreviewView(item: item, manager: manager)
         }
@@ -1152,6 +1588,9 @@ struct HistoryView: View {
         .sheet(item: $smartEditor) { sl in
             SmartListEditor(manager: manager, draft: sl)
         }
+        .sheet(item: $snippetEditor) { s in
+            SnippetEditor(manager: manager, draft: s)
+        }
         .onAppear { installKeyMonitor() }
         .onDisappear { removeKeyMonitor() }
         .onChange(of: searchText) { _, _ in selectedIndex = 0 }
@@ -1159,9 +1598,18 @@ struct HistoryView: View {
     }
 
     // Чип-кнопка фильтра. Подсвечивается, если выбран.
+    // Чипы «Все» и обычных списков принимают перетаскивание записей.
     @ViewBuilder
     private func chip(_ title: String, _ value: HistoryFilter, icon: String? = nil) -> some View {
         let isSelected = filter == value
+        let dropTarget: String?? = {                 // куда назначать при сбросе
+            switch value {
+            case .all:            return .some(nil)          // «Все» = убрать из списка
+            case .list(let name): return .some(name)
+            default:              return nil                 // умные чипы дроп не принимают
+            }
+        }()
+
         Button {
             filter = value
         } label: {
@@ -1183,9 +1631,11 @@ struct HistoryView: View {
             .foregroundStyle(isSelected ? Color.white : Color.primary)
         }
         .buttonStyle(.plain)
+        .modifier(ChipDropModifier(target: dropTarget, manager: manager))
     }
 
     // Одна строка списка — оформлена как отдельная карточка.
+    // Клик — выделить; ⌘-клик — добавить/убрать из выбора; двойной клик — вставить.
     @ViewBuilder
     private func rowView(item: ClipboardItem, index: Int) -> some View {
         HStack(spacing: 8) {
@@ -1199,16 +1649,30 @@ struct HistoryView: View {
                     .foregroundColor(.secondary)
             }
 
-            Button {
-                activate(item)
-            } label: {
+            // Бейдж распознанного типа: свотч цвета / конверт / ссылка.
+            contentBadge(for: item)
+
+            Group {
                 VStack(alignment: .leading, spacing: 2) {
                     switch item.kind {
                     case .text, .file:
-                        Text(item.text ?? "")
-                            .lineLimit(compactMode ? 1 : 2)
-                            .truncationMode(.tail)
+                        if item.isSensitive == true {
+                            // Пароль: содержимое не показываем.
+                            HStack(spacing: 6) {
+                                Image(systemName: "lock.fill")
+                                    .foregroundStyle(.orange)
+                                Text("••••••••")
+                                Text("пароль")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            Text(item.text ?? "")
+                                .lineLimit(compactMode ? 1 : 2)
+                                .truncationMode(.tail)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     case .image:
                         if let nsImage = manager.loadImage(item) {
                             Image(nsImage: nsImage)
@@ -1240,28 +1704,102 @@ struct HistoryView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            // Один тап-жест: выделяет мгновенно; двойной клик определяем сами
+            // по времени, чтобы не ждать таймаут двойного клика (иначе задержка).
+            .onTapGesture {
+                let now = Date()
+                let mods = NSEvent.modifierFlags
+                // Быстрый второй клик по той же записи без модификаторов — вставка.
+                if lastTapID == item.id,
+                   now.timeIntervalSince(lastTapTime) < 0.35,
+                   !mods.contains(.command), !mods.contains(.shift) {
+                    lastTapID = nil
+                    activate(item)
+                    return
+                }
+                lastTapID = item.id
+                lastTapTime = now
+
+                if mods.contains(.shift) {
+                    let lo = min(selectedIndex, index)
+                    let hi = max(selectedIndex, index)
+                    if filteredItems.indices.contains(lo), filteredItems.indices.contains(hi) {
+                        selected = Set(filteredItems[lo...hi].map { $0.id })
+                    }
+                } else if mods.contains(.command) {
+                    toggleSelection(item)
+                    selectedIndex = index
+                } else {
+                    selected = [item.id]
+                    selectedIndex = index
+                }
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, compactMode ? 6 : 9)
         // Карточка: своя подложка со скруглением + тонкая рамка.
+        // Выделение: заливка у выбранных (клик/⌘-клик) и у строки под клавиатурным курсором.
         .background(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(index == selectedIndex
+                .fill((selected.contains(item.id) || index == selectedIndex)
                       ? AnyShapeStyle(Color.accentColor.opacity(0.22))
                       : AnyShapeStyle(.thinMaterial))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                .strokeBorder(
+                    selected.contains(item.id)
+                        ? Color.accentColor
+                        : Color.primary.opacity(0.08),
+                    lineWidth: selected.contains(item.id) ? 2 : 1
+                )
         )
         // Правый клик срабатывает по всей карточке.
         .contentShape(Rectangle())
+        // Перетаскивание в чип списка. Если запись входит в мультивыбор —
+        // тащим все выбранные, иначе только эту.
+        .onDrag {
+            let ids: [UUID] = (selected.contains(item.id) && selected.count > 1)
+                ? filteredItems.filter { selected.contains($0.id) }.map { $0.id }
+                : [item.id]
+            let payload = ids.map { $0.uuidString }.joined(separator: ",")
+            return NSItemProvider(object: payload as NSString)
+        }
         .contextMenu {
             Button("Вставить") { activate(item) }
             Button("Скопировать") {
                 manager.copyToClipboard(item)
                 AppDelegate.shared?.closePopover()
+            }
+            // Преобразования текста (только для текстовых записей).
+            if item.kind == .text, let text = item.text {
+                Menu("Скопировать как") {
+                    Button("ВЕРХНИЙ РЕГИСТР") {
+                        manager.copyText(text.uppercased())
+                        AppDelegate.shared?.closePopover()
+                    }
+                    Button("нижний регистр") {
+                        manager.copyText(text.lowercased())
+                        AppDelegate.shared?.closePopover()
+                    }
+                    Button("Без лишних пробелов") {
+                        let cleaned = text
+                            .components(separatedBy: .whitespacesAndNewlines)
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " ")
+                        manager.copyText(cleaned)
+                        AppDelegate.shared?.closePopover()
+                    }
+                    Button("Одной строкой") {
+                        let oneLine = text
+                            .components(separatedBy: .newlines)
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " ")
+                        manager.copyText(oneLine)
+                        AppDelegate.shared?.closePopover()
+                    }
+                }
             }
             if item.kind == .image {
                 Button("Сохранить изображение…") { saveImage(item) }
@@ -1277,6 +1815,37 @@ struct HistoryView: View {
             Divider()
             Button("Удалить", role: .destructive) { manager.delete(item) }
         }
+    }
+
+    // Бейдж распознанного типа контента.
+    @ViewBuilder
+    private func contentBadge(for item: ClipboardItem) -> some View {
+        switch detectContentType(item) {
+        case .color(let c):
+            RoundedRectangle(cornerRadius: 3)
+                .fill(Color(nsColor: c))
+                .frame(width: 16, height: 16)
+                .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary.opacity(0.4)))
+        case .email:
+            Image(systemName: "envelope").foregroundStyle(.secondary)
+        case .link:
+            Image(systemName: "link").foregroundStyle(.secondary)
+        case .plain:
+            EmptyView()
+        }
+    }
+
+    private func toggleSelection(_ item: ClipboardItem) {
+        if selected.contains(item.id) { selected.remove(item.id) }
+        else { selected.insert(item.id) }
+    }
+
+    private func copySelected() {
+        // Копируем в порядке отображения.
+        let items = filteredItems.filter { selected.contains($0.id) }
+        manager.copyCombined(items)
+        selected.removeAll()
+        AppDelegate.shared?.closePopover()
     }
 
     // Сохранить картинку записи через системную панель сохранения.
@@ -1296,6 +1865,66 @@ struct HistoryView: View {
             AppDelegate.shared?.closeAndPaste()
         } else {
             AppDelegate.shared?.closePopover()
+        }
+    }
+
+    // Вставка заготовки: кладём её текст в буфер и вставляем как обычную запись.
+    private func activateSnippet(_ snippet: Snippet) {
+        manager.copyText(snippet.text)
+        if autoPaste && PasteHelper.hasAccessibilityPermission {
+            AppDelegate.shared?.closeAndPaste()
+        } else {
+            AppDelegate.shared?.closePopover()
+        }
+    }
+
+    // Экран текстовых заготовок.
+    private var snippetsList: some View {
+        Group {
+            if manager.snippets.isEmpty {
+                VStack(spacing: 10) {
+                    Text("Заготовок пока нет")
+                        .foregroundColor(.secondary)
+                    Button("Создать заготовку") {
+                        snippetEditor = Snippet(title: "", text: "")
+                    }
+                }
+                .frame(maxHeight: .infinity)
+                .padding(30)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 6) {
+                        ForEach(manager.snippets) { snippet in
+                            Button {
+                                activateSnippet(snippet)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(snippet.title.isEmpty ? "Без названия" : snippet.title)
+                                        .font(.callout).bold()
+                                    Text(snippet.text)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(2)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .contentShape(Rectangle())
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 9)
+                                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.thinMaterial))
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Вставить") { activateSnippet(snippet) }
+                                Button("Изменить") { snippetEditor = snippet }
+                                Divider()
+                                Button("Удалить", role: .destructive) { manager.deleteSnippet(snippet) }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                }
+            }
         }
     }
 
@@ -1325,12 +1954,20 @@ struct HistoryView: View {
             if !items.isEmpty { selectedIndex = max(selectedIndex - 1, 0) }
             return true
         case 36:  // Enter
+            if selected.count > 1 {
+                copySelected()          // мультивыбор: скопировать всё выбранное
+                return true
+            }
             if items.indices.contains(selectedIndex) {
                 activate(items[selectedIndex])
                 return true
             }
             return false
-        case 53:  // Esc
+        case 53:  // Esc — сначала сбрасывает мультивыбор, затем закрывает панель
+            if !selected.isEmpty {
+                selected.removeAll()
+                return true
+            }
             AppDelegate.shared?.closePopover()
             return true
         case 51:  // ⌫ Delete — удалить выбранную запись (если не печатаем в поиске)
@@ -1405,6 +2042,51 @@ struct PreviewView: View {
     }
 }
 
+// MARK: - Редактор сниппета
+
+struct SnippetEditor: View {
+    @ObservedObject var manager: ClipboardManager
+    @Environment(\.dismiss) private var dismiss
+    @State var draft: Snippet
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Заготовка").font(.headline)
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+            }
+
+            TextField("Название", text: $draft.title)
+                .textFieldStyle(.roundedBorder)
+
+            Text("Текст заготовки")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: $draft.text)
+                .font(.body)
+                .frame(minHeight: 140)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.secondary.opacity(0.3)))
+
+            HStack {
+                Spacer()
+                Button("Сохранить") {
+                    manager.saveSnippet(draft)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 440, height: 340)
+    }
+}
+
 // MARK: - Редактор умного списка
 
 struct SmartListEditor: View {
@@ -1441,16 +2123,21 @@ struct SmartListEditor: View {
 
             ForEach($draft.rules) { $rule in
                 HStack(spacing: 6) {
-                    Picker("", selection: $rule.field) {
+                    // Поле и его значение меняем одним действием, чтобы значение
+                    // всегда соответствовало вариантам выбранного поля.
+                    Picker("", selection: Binding(
+                        get: { rule.field },
+                        set: { newField in
+                            $rule.field.wrappedValue = newField
+                            $rule.value.wrappedValue = defaultRuleValue(for: newField)
+                        }
+                    )) {
                         Text("Тип").tag(SmartRule.Field.type)
                         Text("Дата").tag(SmartRule.Field.date)
                         Text("Содержит").tag(SmartRule.Field.contains)
                     }
                     .labelsHidden()
                     .fixedSize()
-                    .onChange(of: rule.field) { _, newField in
-                        $rule.value.wrappedValue = defaultRuleValue(for: newField)
-                    }
 
                     ruleValueEditor($rule)
                     Spacer()
@@ -1548,6 +2235,7 @@ struct GeneralSettingsTab: View {
 
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginErrorText: String?
+    @State private var backupMessage: String?
 
     var body: some View {
         Form {
@@ -1594,8 +2282,54 @@ struct GeneralSettingsTab: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Резервная копия") {
+                HStack {
+                    Button("Экспорт…") { exportBackup() }
+                    Button("Импорт…") { importBackup() }
+                }
+                if let backupMessage {
+                    Text(backupMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Сохраняет историю, списки, умные списки и заготовки в файл. Картинки-вложения в файл не входят.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
+    }
+
+    private func exportBackup() {
+        guard let data = manager.exportBackup() else {
+            backupMessage = "Не удалось подготовить данные"; return
+        }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "ClipboardHistory-backup.json"
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                try data.write(to: url)
+                backupMessage = "Экспортировано"
+            } catch {
+                backupMessage = "Ошибка записи: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func importBackup() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            if let data = try? Data(contentsOf: url), manager.importBackup(data) {
+                backupMessage = "Импортировано"
+            } else {
+                backupMessage = "Не удалось прочитать файл резервной копии"
+            }
+        }
     }
 }
 
@@ -1672,6 +2406,9 @@ struct ListsSettingsTab: View {
     @ObservedObject var manager: ClipboardManager
     @State private var newListName = ""
     @State private var smartEditor: SmartList?
+    @State private var snippetEditor: Snippet?
+    @State private var renameTarget: String?
+    @State private var renameText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1693,6 +2430,16 @@ struct ListsSettingsTab: View {
                                 .foregroundStyle(.tertiary)
                             Text(name)
                             Spacer()
+                            if name != "📌" {   // системный список не переименовываем
+                                Button {
+                                    renameText = name
+                                    renameTarget = name
+                                } label: {
+                                    Image(systemName: "pencil")
+                                }
+                                .buttonStyle(.plain)
+                                .help("Переименовать")
+                            }
                             Button {
                                 manager.deleteList(name)
                             } label: {
@@ -1734,6 +2481,36 @@ struct ListsSettingsTab: View {
                     }
                     .buttonStyle(.plain)
                 }
+
+                Section("Заготовки") {
+                    if manager.snippets.isEmpty {
+                        Text("Пока нет заготовок").foregroundStyle(.secondary)
+                    }
+                    ForEach(manager.snippets) { snippet in
+                        HStack {
+                            Image(systemName: "text.badge.star")
+                                .foregroundStyle(.tertiary)
+                            Text(snippet.title.isEmpty ? "Без названия" : snippet.title)
+                            Spacer()
+                            Button { snippetEditor = snippet } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Изменить")
+                            Button { manager.deleteSnippet(snippet) } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.plain)
+                            .help("Удалить заготовку")
+                        }
+                    }
+                    Button {
+                        snippetEditor = Snippet(title: "", text: "")
+                    } label: {
+                        Label("Создать заготовку", systemImage: "plus")
+                    }
+                    .buttonStyle(.plain)
+                }
             }
 
             HStack {
@@ -1747,6 +2524,22 @@ struct ListsSettingsTab: View {
         }
         .sheet(item: $smartEditor) { sl in
             SmartListEditor(manager: manager, draft: sl)
+        }
+        .sheet(item: $snippetEditor) { s in
+            SnippetEditor(manager: manager, draft: s)
+        }
+        .alert("Переименовать список", isPresented: Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        )) {
+            TextField("Название", text: $renameText)
+            Button("Сохранить") {
+                if let old = renameTarget {
+                    manager.renameList(old, to: renameText)
+                }
+                renameTarget = nil
+            }
+            Button("Отмена", role: .cancel) { renameTarget = nil }
         }
     }
 
@@ -1832,6 +2625,7 @@ struct ShortcutsSettingsTab: View {
 struct ExclusionsSettingsTab: View {
     @ObservedObject var manager: ClipboardManager
     @AppStorage("savePasswords") private var savePasswords = false
+    @AppStorage("hidePasswordLike") private var hidePasswordLike = false
 
     var body: some View {
         Form {
@@ -1871,6 +2665,12 @@ struct ExclusionsSettingsTab: View {
                     .font(.caption)
                     .foregroundStyle(savePasswords ? .red : .secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                Toggle("Пропускать текст, похожий на пароль", isOn: $hidePasswordLike)
+                    .disabled(savePasswords)
+                Text("Дополнительная защита: строки без пробелов из букв, цифр и символов (8–64 знака) не попадут в историю, даже если приложение не пометило их как пароль. Может изредка пропускать похожие коды и ключи.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .formStyle(.grouped)
@@ -1901,6 +2701,76 @@ struct ExclusionsSettingsTab: View {
 }
 
 // Вкладка «Информация»: о проекте, ссылка на GitHub и проверка обновлений.
+// MARK: - Онбординг (первый запуск)
+
+struct OnboardingView: View {
+    let onDone: () -> Void
+    @State private var hasPermission = PasteHelper.hasAccessibilityPermission
+
+    private var combo: String {
+        let mod = hotkeyModifierOptions.first { $0.flags == UserDefaults.standard.integer(forKey: "hotkeyModifiers") }?.name ?? "⇧⌘"
+        let key = hotkeyKeyOptions.first { $0.code == UserDefaults.standard.integer(forKey: "hotkeyKeyCode") }?.name ?? "V"
+        return mod + key
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 44))
+                .foregroundStyle(.tint)
+            Text("ClipboardHistory").font(.title).bold()
+            Text("Менеджер буфера обмена, который живёт в строке меню.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            VStack(alignment: .leading, spacing: 14) {
+                onboardRow("keyboard", "Вызов панели",
+                           "Нажмите \(combo) из любого приложения — откроется история буфера.")
+                onboardRow("list.bullet", "Списки и заготовки",
+                           "Раскладывайте записи по спискам, создавайте умные списки по правилам и постоянные текстовые заготовки.")
+                onboardRow("hand.raised", "Автовставка",
+                           "Чтобы запись вставлялась сразу в активное окно, нужно разрешение «Универсальный доступ».")
+            }
+            .padding()
+            .background(RoundedRectangle(cornerRadius: 12).fill(.thinMaterial))
+
+            if hasPermission {
+                Label("Разрешение выдано", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else {
+                Button("Разрешить автовставку…") { PasteHelper.requestPermission() }
+            }
+
+            Spacer()
+            Button("Начать") { onDone() }
+                .keyboardShortcut(.defaultAction)
+                .controlSize(.large)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            hasPermission = PasteHelper.hasAccessibilityPermission
+        }
+    }
+
+    @ViewBuilder
+    private func onboardRow(_ icon: String, _ title: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3)
+                .foregroundStyle(.tint)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 struct InfoSettingsTab: View {
     @State private var updateStatus: String?
     @State private var updateAvailable = false
@@ -1972,6 +2842,10 @@ struct InfoSettingsTab: View {
                          destination: URL(string: UpdateChecker.repo + "/releases")!)
                 }
             }
+            Button("Показать приветствие снова") {
+                AppDelegate.shared?.showOnboardingWindow()
+            }
+            .buttonStyle(.link)
             Spacer()
         }
         .padding(20)
