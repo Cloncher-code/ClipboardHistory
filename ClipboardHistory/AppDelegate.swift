@@ -10,6 +10,9 @@ import Carbon
 import ServiceManagement
 import CryptoKit
 import UniformTypeIdentifiers
+#if canImport(Sparkle)
+import Sparkle   // автообновления; подключается через Swift Package Manager
+#endif
 
 // MARK: - AppDelegate: иконка в меню-баре, поповер, хоткей
 
@@ -32,15 +35,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var clickMonitor: Any?                  // следит за кликами вне панели
     private var settingsWindow: NSWindow?           // отдельное окно настроек
     private var databaseWindow: NSWindow?           // окно просмотра базы
+    #if canImport(Sparkle)
+    private var updaterController: SPUStandardUpdaterController?
+    #endif
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
 
+        // Sparkle: тихая проверка обновлений по расписанию + UI обновления.
+        #if canImport(Sparkle)
+        updaterController = SPUStandardUpdaterController(startingUpdater: true,
+                                                         updaterDelegate: nil,
+                                                         userDriverDelegate: nil)
+        #endif
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "doc.on.clipboard",
-                                           accessibilityDescription: "История буфера")
+                                           accessibilityDescription: String(localized: "История буфера"))
         statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.target = self
+        // Реагируем и на левый, и на правый клик (правый — контекстное меню).
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
 
         // Плавающая панель вместо поповера: она умеет показываться
         // поверх полноэкранных приложений, не переключая Space.
@@ -84,7 +99,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.onboardingWindow?.close()
         })
         let window = NSWindow(contentViewController: hosting)
-        window.title = "Добро пожаловать"
+        window.title = String(localized: "Добро пожаловать")
         window.styleMask = [.titled, .closable]
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: 460, height: 520))
@@ -95,6 +110,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePopover() {
+        // Правый клик по иконке — контекстное меню вместо панели.
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp {
+            showStatusMenu()
+            return
+        }
         if panel.isVisible {
             closePopover()
         } else {
@@ -137,11 +157,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let size: NSSize
         if pos.isDock {
             size = NSSize(width: width, height: visible.height - margin * 2)  // вся высота
+        } else if pos.isHorizontalDock {
+            size = NSSize(width: visible.width - margin * 2,                  // вся ширина
+                          height: PanelSize.current.stripHeight)
         } else {
             size = PanelSize.current.size
         }
         panel.setContentSize(size)
         manager.dockHeight = size.height   // чтобы SwiftUI-контент совпал по высоте
+        manager.dockWidth = size.width     // ...и по ширине (для ленты)
         positionPanel(on: screen)
     }
 
@@ -182,6 +206,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .dockLeft:
             origin = NSPoint(x: visible.minX + margin,
                              y: visible.minY + margin)
+        case .dockBottom:
+            origin = NSPoint(x: visible.minX + margin,
+                             y: visible.minY + margin)
+        case .dockTop:
+            origin = NSPoint(x: visible.minX + margin,
+                             y: visible.maxY - size.height - margin)
         }
         // Не вылезать за края выбранного экрана.
         origin.x = max(visible.minX + margin, min(origin.x, visible.maxX - size.width - margin))
@@ -207,16 +237,78 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // Видна ли сейчас панель (для гарда клавиатурного монитора).
+    var isPanelVisible: Bool { panel?.isVisible ?? false }
+
     // Перепривязать глобальный хоткей после изменения в настройках.
     func reregisterHotKey() {
         hotKey?.register()
+    }
+
+    // MARK: Контекстное меню иконки статус-бара (правый клик)
+
+    private func showStatusMenu() {
+        let menu = NSMenu()
+
+        let open = NSMenuItem(title: String(localized: "Открыть панель"),
+                              action: #selector(menuOpenPanel), keyEquivalent: "")
+        open.target = self
+        menu.addItem(open)
+
+        let pause = NSMenuItem(title: String(localized: "Пауза записи"),
+                               action: #selector(menuTogglePause), keyEquivalent: "")
+        pause.target = self
+        pause.state = manager.isPaused ? .on : .off
+        menu.addItem(pause)
+
+        menu.addItem(.separator())
+
+        let settings = NSMenuItem(title: String(localized: "Настройки…"),
+                                  action: #selector(menuOpenSettings), keyEquivalent: "")
+        settings.target = self
+        menu.addItem(settings)
+
+        let updates = NSMenuItem(title: String(localized: "Проверить обновления…"),
+                                 action: #selector(menuCheckUpdates), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(title: String(localized: "Выйти"),
+                              action: #selector(menuQuit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        // Трюк: временно назначаем меню и «кликаем» — оно откроется у иконки.
+        // Затем убираем, чтобы левый клик продолжил открывать панель.
+        statusItem.menu = menu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    @objc private func menuOpenPanel()   { togglePopover() }
+    @objc private func menuTogglePause() { manager.isPaused.toggle() }
+    @objc private func menuOpenSettings(){ showSettingsWindow() }
+    @objc private func menuCheckUpdates(){ checkForUpdates() }
+    @objc private func menuQuit()        { NSApplication.shared.terminate(nil) }
+
+    // Проверить обновления: через Sparkle, если подключён;
+    // иначе открываем настройки с ручным чекером на вкладке «Информация».
+    func checkForUpdates() {
+        #if canImport(Sparkle)
+        closePopover()
+        updaterController?.checkForUpdates(nil)
+        #else
+        showSettingsWindow()
+        #endif
     }
 
     // Иконка в меню-баре: обычная или «пауза».
     func updateStatusIcon() {
         let name = manager.isPaused ? "pause.circle" : "doc.on.clipboard"
         statusItem.button?.image = NSImage(systemSymbolName: name,
-                                           accessibilityDescription: "История буфера")
+                                           accessibilityDescription: String(localized: "История буфера"))
     }
 
     // Сменить размер/позицию панели на лету (из настроек/меню).
@@ -242,7 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let hosting = NSHostingController(rootView: SettingsView(manager: manager))
         let window = NSWindow(contentViewController: hosting)
-        window.title = "Настройки"
+        window.title = String(localized: "Настройки")
         window.styleMask = [.titled, .closable]   // настоящее окно: системные скруглённые углы
         window.isReleasedWhenClosed = false
         window.center()
@@ -262,7 +354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let hosting = NSHostingController(rootView: DatabaseView(manager: manager))
         let window = NSWindow(contentViewController: hosting)
-        window.title = "База данных"
+        window.title = String(localized: "База данных")
         window.styleMask = [.titled, .closable, .resizable]
         window.isReleasedWhenClosed = false
         window.setContentSize(NSSize(width: 720, height: 460))

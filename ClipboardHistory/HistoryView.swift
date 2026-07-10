@@ -40,6 +40,21 @@ struct ChipBackground: ViewModifier {
     }
 }
 
+// Стеклянный стиль кнопки на macOS 26, обычный — на старых системах.
+struct GlassButton: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.buttonStyle(.glass)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func glassButton() -> some View { modifier(GlassButton()) }
+}
+
 // MARK: - Приём перетаскивания записи на чип списка
 
 struct ChipDropModifier: ViewModifier {
@@ -223,6 +238,34 @@ struct HistoryView: View {
                     .foregroundColor(.secondary)
                     .frame(maxHeight: .infinity)
                     .padding(30)
+            } else if panelPosition.isHorizontalDock {
+                // Горизонтальная лента плиток (режим «как в Paste»).
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(spacing: 8) {
+                            ForEach(Array(filteredItems.enumerated()), id: \.element.id) { index, item in
+                                tileView(item: item, index: index)
+                                    .id(item.id)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                    }
+                    .onChange(of: selectedIndex) { _, newIndex in
+                        if filteredItems.indices.contains(newIndex) {
+                            proxy.scrollTo(filteredItems[newIndex].id)
+                        }
+                    }
+                    .onChange(of: manager.openToken) { _, _ in
+                        selectedIndex = 0
+                        selected.removeAll()
+                        if let first = filteredItems.first {
+                            DispatchQueue.main.async {
+                                proxy.scrollTo(first.id, anchor: .leading)
+                            }
+                        }
+                    }
+                }
             } else {
                 ScrollViewReader { proxy in
                     // ScrollView вместо List: у List (таблица AppKit под капотом)
@@ -262,7 +305,9 @@ struct HistoryView: View {
             HStack {
                 if selected.count > 1 {
                     Button("Скопировать (\(selected.count))") { copySelected() }
+                        .glassButton()
                     Button("Сброс") { selected.removeAll() }
+                        .glassButton()
                     Spacer()
                 } else {
                     Text("\(comboLabel) — открыть · ⌘клик — мультивыбор")
@@ -278,6 +323,9 @@ struct HistoryView: View {
                     }
                     Button("Просмотр базы данных") {
                         AppDelegate.shared?.showDatabaseWindow()
+                    }
+                    Button("Проверить обновления…") {
+                        AppDelegate.shared?.checkForUpdates()
                     }
                     Picker("Режим отображения", selection: $compactMode) {
                         Text("Подробный").tag(false)
@@ -307,11 +355,12 @@ struct HistoryView: View {
             }
             .padding(8)
         }
-        .frame(width: panelSize.size.width,
-               height: panelPosition.isDock ? manager.dockHeight : panelSize.size.height)
+        .frame(width: panelPosition.isHorizontalDock ? manager.dockWidth : panelSize.size.width,
+               height: (panelPosition.isDock || panelPosition.isHorizontalDock)
+                       ? manager.dockHeight : panelSize.size.height)
         // Матовое стекло вместо плоского фона — основной приём оформления macOS 26.
         .background(.regularMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .onChange(of: panelSize) { _, _ in AppDelegate.shared?.resizePanel() }
         .onChange(of: panelPosition) { _, _ in AppDelegate.shared?.resizePanel() }
         .sheet(item: $previewItem) { item in
@@ -443,10 +492,17 @@ struct HistoryView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    // В кратком режиме мета-строку (дата/список/RTF) прячем.
+                    // В кратком режиме мета-строку (дата/список/метаданные) прячем.
                     if !compactMode {
                         HStack(spacing: 6) {
                             Text(Stamp.label(for: item.date))
+                            if item.kind == .image, let info = manager.imageInfo(item) {
+                                Text("· \(info)")
+                            }
+                            if item.kind == .text, item.isSensitive != true,
+                               !isLinkItem(item), let t = item.text, t.count > 40 {
+                                Text("· \(wordStat(t))")
+                            }
                             if let list = item.listName {
                                 Text("· \(list)")
                             }
@@ -456,6 +512,7 @@ struct HistoryView: View {
                         }
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -463,34 +520,7 @@ struct HistoryView: View {
             }
             // Один тап-жест: выделяет мгновенно; двойной клик определяем сами
             // по времени, чтобы не ждать таймаут двойного клика (иначе задержка).
-            .onTapGesture {
-                let now = Date()
-                let mods = NSEvent.modifierFlags
-                // Быстрый второй клик по той же записи без модификаторов — вставка.
-                if lastTapID == item.id,
-                   now.timeIntervalSince(lastTapTime) < 0.35,
-                   !mods.contains(.command), !mods.contains(.shift) {
-                    lastTapID = nil
-                    activate(item)
-                    return
-                }
-                lastTapID = item.id
-                lastTapTime = now
-
-                if mods.contains(.shift) {
-                    let lo = min(selectedIndex, index)
-                    let hi = max(selectedIndex, index)
-                    if filteredItems.indices.contains(lo), filteredItems.indices.contains(hi) {
-                        selected = Set(filteredItems[lo...hi].map { $0.id })
-                    }
-                } else if mods.contains(.command) {
-                    toggleSelection(item)
-                    selectedIndex = index
-                } else {
-                    selected = [item.id]
-                    selectedIndex = index
-                }
-            }
+            .onTapGesture { handleTap(item: item, index: index) }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, compactMode ? 6 : 9)
@@ -515,14 +545,13 @@ struct HistoryView: View {
         .contentShape(Rectangle())
         // Перетаскивание в чип списка. Если запись входит в мультивыбор —
         // тащим все выбранные, иначе только эту.
-        .onDrag {
-            let ids: [UUID] = (selected.contains(item.id) && selected.count > 1)
-                ? filteredItems.filter { selected.contains($0.id) }.map { $0.id }
-                : [item.id]
-            let payload = ids.map { $0.uuidString }.joined(separator: ",")
-            return NSItemProvider(object: payload as NSString)
-        }
-        .contextMenu {
+        .onDrag { dragProvider(for: item) }
+        .contextMenu { contextMenuContent(item: item) }
+    }
+
+    // Общее контекстное меню записи (для строк и плиток ленты).
+    @ViewBuilder
+    private func contextMenuContent(item: ClipboardItem) -> some View {
             Button("Вставить") { activate(item) }
             if isLinkItem(item), item.isSensitive != true,
                let t = item.text?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -530,6 +559,28 @@ struct HistoryView: View {
                 Button("Открыть ссылку") {
                     NSWorkspace.shared.open(url)
                     AppDelegate.shared?.closePopover()
+                }
+            }
+            if case .phone = detectContentType(item),
+               let t = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                Button("Позвонить") {
+                    let digits = t.filter { "+0123456789".contains($0) }
+                    if let url = URL(string: "tel://\(digits)") {
+                        NSWorkspace.shared.open(url)
+                    }
+                    AppDelegate.shared?.closePopover()
+                }
+            }
+            if case .color(let color) = detectContentType(item) {
+                Menu("Скопировать цвет как") {
+                    Button(rgbString(color)) {
+                        manager.copyText(rgbString(color))
+                        AppDelegate.shared?.closePopover()
+                    }
+                    Button(hslString(color)) {
+                        manager.copyText(hslString(color))
+                        AppDelegate.shared?.closePopover()
+                    }
                 }
             }
             Button("Скопировать") {
@@ -579,7 +630,125 @@ struct HistoryView: View {
             Button("Предпросмотр") { previewItem = item }
             Divider()
             Button("Удалить", role: .destructive) { manager.delete(item) }
+    }
+
+    // Общая обработка клика (выделение / ⌘ мультивыбор / ⇧ диапазон / двойной клик — вставка).
+    private func handleTap(item: ClipboardItem, index: Int) {
+        let now = Date()
+        let mods = NSEvent.modifierFlags
+        if lastTapID == item.id,
+           now.timeIntervalSince(lastTapTime) < 0.35,
+           !mods.contains(.command), !mods.contains(.shift) {
+            lastTapID = nil
+            activate(item)
+            return
         }
+        lastTapID = item.id
+        lastTapTime = now
+
+        if mods.contains(.shift) {
+            let lo = min(selectedIndex, index)
+            let hi = max(selectedIndex, index)
+            if filteredItems.indices.contains(lo), filteredItems.indices.contains(hi) {
+                selected = Set(filteredItems[lo...hi].map { $0.id })
+            }
+        } else if mods.contains(.command) {
+            toggleSelection(item)
+            selectedIndex = index
+        } else {
+            selected = [item.id]
+            selectedIndex = index
+        }
+    }
+
+    // Общий провайдер перетаскивания (одна запись или весь мультивыбор).
+    private func dragProvider(for item: ClipboardItem) -> NSItemProvider {
+        let ids: [UUID] = (selected.contains(item.id) && selected.count > 1)
+            ? filteredItems.filter { selected.contains($0.id) }.map { $0.id }
+            : [item.id]
+        let payload = ids.map { $0.uuidString }.joined(separator: ",")
+        return NSItemProvider(object: payload as NSString)
+    }
+
+    // Плитка для горизонтальной ленты (режим «как в Paste»).
+    @ViewBuilder
+    private func tileView(item: ClipboardItem, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if let appIcon = AppIcon.icon(for: item.sourceBundleID) {
+                    Image(nsImage: appIcon)
+                        .resizable()
+                        .frame(width: 18, height: 18)
+                }
+                contentBadge(for: item)
+                Spacer()
+                Text(Stamp.label(for: item.date))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
+            Group {
+                switch item.kind {
+                case .text, .file:
+                    if item.isSensitive == true {
+                        HStack(spacing: 6) {
+                            Image(systemName: "lock.fill").foregroundStyle(.orange)
+                            Text("••••••••")
+                        }
+                    } else if let title = item.linkTitle {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(title).lineLimit(3)
+                            Text(item.text ?? "")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                        }
+                    } else {
+                        Text(item.text ?? "")
+                            .font(.callout)
+                            .lineLimit(7)
+                    }
+                case .image:
+                    if let nsImage = manager.loadImage(item) {
+                        Image(nsImage: nsImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .cornerRadius(6)
+                    } else {
+                        Text("⚠️ Картинка не найдена").foregroundColor(.secondary)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            if let list = item.listName {
+                Text(list)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(width: 190)
+        .frame(maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill((selected.contains(item.id) || index == selectedIndex)
+                      ? AnyShapeStyle(Color.accentColor.opacity(0.22))
+                      : AnyShapeStyle(.thinMaterial))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(
+                    selected.contains(item.id) ? Color.accentColor : Color.primary.opacity(0.08),
+                    lineWidth: selected.contains(item.id) ? 2 : 1
+                )
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { handleTap(item: item, index: index) }
+        .onDrag { dragProvider(for: item) }
+        .contextMenu { contextMenuContent(item: item) }
     }
 
     // Бейдж распознанного типа контента.
@@ -602,6 +771,8 @@ struct HistoryView: View {
             } else {
                 Image(systemName: "link").foregroundStyle(.secondary)
             }
+        case .phone:
+            Image(systemName: "phone").foregroundStyle(.secondary)
         case .plain:
             EmptyView()
         }
@@ -610,6 +781,12 @@ struct HistoryView: View {
     private func toggleSelection(_ item: ClipboardItem) {
         if selected.contains(item.id) { selected.remove(item.id) }
         else { selected.insert(item.id) }
+    }
+
+    // «123 сл. · 890 симв.» для длинных текстов.
+    private func wordStat(_ text: String) -> String {
+        let words = text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
+        return String(localized: "\(words) сл. · \(text.count) симв.")
     }
 
     private func copySelected() {
@@ -714,6 +891,9 @@ struct HistoryView: View {
     }
 
     private func handleKey(_ event: NSEvent) -> Bool {
+        // Панель скрыта (orderOut не размонтирует вью) — не перехватываем ничего,
+        // иначе клавиши в окнах настроек/базы управляли бы историей.
+        guard AppDelegate.shared?.isPanelVisible == true else { return false }
         let items = filteredItems
         // Если пользователь печатает в поле поиска — цифры и пробел не перехватываем.
         let isTyping = NSApp.keyWindow?.firstResponder is NSTextView
@@ -725,6 +905,18 @@ struct HistoryView: View {
         case 126: // ↑
             if !items.isEmpty { selectedIndex = max(selectedIndex - 1, 0) }
             return true
+        case 124: // → (лента: следующая запись; в поиске не перехватываем)
+            if !isTyping, !items.isEmpty {
+                selectedIndex = min(selectedIndex + 1, items.count - 1)
+                return true
+            }
+            return false
+        case 123: // ← (лента: предыдущая запись)
+            if !isTyping, !items.isEmpty {
+                selectedIndex = max(selectedIndex - 1, 0)
+                return true
+            }
+            return false
         case 36:  // Enter
             if selected.count > 1 {
                 copySelected()          // мультивыбор: скопировать всё выбранное
@@ -735,8 +927,8 @@ struct HistoryView: View {
                 return true
             }
             return false
-        case 53:  // Esc — сначала сбрасывает мультивыбор, затем закрывает панель
-            if !selected.isEmpty {
+        case 53:  // Esc — сбрасывает мультивыбор; иначе закрывает панель
+            if selected.count > 1 {
                 selected.removeAll()
                 return true
             }

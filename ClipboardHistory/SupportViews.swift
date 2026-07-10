@@ -47,14 +47,14 @@ struct DatabaseView: View {
 
     private func typeLabel(_ item: ClipboardItem) -> String {
         switch item.kind {
-        case .text: return "Текст"
-        case .image: return "Картинка"
-        case .file: return "Файл"
+        case .text: return String(localized: "Текст")
+        case .image: return String(localized: "Картинка")
+        case .file: return String(localized: "Файл")
         }
     }
     private func contentLabel(_ item: ClipboardItem) -> String {
-        if item.isSensitive == true { return "•••••••• (пароль)" }
-        return item.kind == .image ? "[изображение]" : (item.text ?? "")
+        if item.isSensitive == true { return String(localized: "•••••••• (пароль)") }
+        return item.kind == .image ? String(localized: "[изображение]") : (item.text ?? "")
     }
     private func sourceLabel(_ item: ClipboardItem) -> String {
         guard let id = item.sourceBundleID else { return "—" }
@@ -112,7 +112,9 @@ struct PreviewView: View {
 
 struct OnboardingView: View {
     let onDone: () -> Void
+    @State private var step = 0
     @State private var hasPermission = PasteHelper.hasAccessibilityPermission
+    private let totalSteps = 4
 
     private var combo: String {
         let mod = hotkeyModifierOptions.first { $0.flags == UserDefaults.standard.integer(forKey: "hotkeyModifiers") }?.name ?? "⇧⌘"
@@ -121,37 +123,47 @@ struct OnboardingView: View {
     }
 
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "doc.on.clipboard")
-                .font(.system(size: 44))
-                .foregroundStyle(.tint)
-            Text("ClipboardHistory").font(.title).bold()
-            Text("Менеджер буфера обмена, который живёт в строке меню.")
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        VStack(spacing: 20) {
+            Spacer(minLength: 8)
 
-            VStack(alignment: .leading, spacing: 14) {
-                onboardRow("keyboard", "Вызов панели",
-                           "Нажмите \(combo) из любого приложения — откроется история буфера.")
-                onboardRow("list.bullet", "Списки и заготовки",
-                           "Раскладывайте записи по спискам, создавайте умные списки по правилам и постоянные текстовые заготовки.")
-                onboardRow("hand.raised", "Автовставка",
-                           "Чтобы запись вставлялась сразу в активное окно, нужно разрешение «Универсальный доступ».")
+            // Содержимое текущего шага.
+            Group {
+                switch step {
+                case 0: welcomeStep
+                case 1: panelStep
+                case 2: organizeStep
+                default: pasteStep
+                }
             }
-            .padding()
-            .background(RoundedRectangle(cornerRadius: 12).fill(.thinMaterial))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if hasPermission {
-                Label("Разрешение выдано", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            } else {
-                Button("Разрешить автовставку…") { PasteHelper.requestPermission() }
+            // Точки-индикаторы шагов.
+            HStack(spacing: 8) {
+                ForEach(0..<totalSteps, id: \.self) { i in
+                    Circle()
+                        .fill(i == step ? Color.accentColor : Color.secondary.opacity(0.3))
+                        .frame(width: 8, height: 8)
+                }
             }
 
-            Spacer()
-            Button("Начать") { onDone() }
-                .keyboardShortcut(.defaultAction)
-                .controlSize(.large)
+            // Навигация.
+            HStack {
+                if step > 0 {
+                    Button("Назад") { withAnimation { step -= 1 } }
+                }
+                Spacer()
+                if step < totalSteps - 1 {
+                    Button("Далее") { withAnimation { step += 1 } }
+                        .keyboardShortcut(.defaultAction)
+                        .controlSize(.large)
+                        .buttonStyle(.borderedProminent)
+                } else {
+                    Button("Начать") { onDone() }
+                        .keyboardShortcut(.defaultAction)
+                        .controlSize(.large)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -160,20 +172,76 @@ struct OnboardingView: View {
         }
     }
 
-    @ViewBuilder
-    private func onboardRow(_ icon: String, _ title: String, _ text: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: icon)
-                .font(.title3)
+    // Шаг 1: приветствие.
+    private var welcomeStep: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.system(size: 56))
                 .foregroundStyle(.tint)
-                .frame(width: 24)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.headline)
-                Text(text)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("ClipboardHistory").font(.largeTitle).bold()
+            Text("Менеджер буфера обмена, который живёт в строке меню.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    // Шаг 2: вызов панели.
+    private var panelStep: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "keyboard")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+            Text("Вызов панели").font(.title2).bold()
+            KeyCap(text: combo)
+                .scaleEffect(1.4)
+                .padding(.vertical, 6)
+            Text("Нажмите \(combo) из любого приложения — откроется история буфера.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text("Сочетание можно поменять в настройках, вкладка «Клавиши».")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // Шаг 3: организация.
+    private var organizeStep: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "list.bullet.rectangle")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+            Text("Списки и заготовки").font(.title2).bold()
+            Text("Раскладывайте записи по спискам, создавайте умные списки по правилам и постоянные текстовые заготовки.")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text("Перетаскивайте записи на чипы списков, ⌘клик — мультивыбор, правый клик — все действия.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    // Шаг 4: автовставка и разрешение.
+    private var pasteStep: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "hand.raised")
+                .font(.system(size: 48))
+                .foregroundStyle(.tint)
+            Text("Автовставка").font(.title2).bold()
+            Text("Чтобы запись вставлялась сразу в активное окно, нужно разрешение «Универсальный доступ».")
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            if hasPermission {
+                Label("Разрешение выдано", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else {
+                Button("Разрешить автовставку…") { PasteHelper.requestPermission() }
+                    .buttonStyle(.borderedProminent)
             }
+            Text("Этот шаг можно пропустить и вернуться позже: Настройки → Вставка.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
     }
 }

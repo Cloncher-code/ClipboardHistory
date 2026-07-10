@@ -64,9 +64,17 @@ enum PanelSize: String, CaseIterable {
     }
     var title: String {
         switch self {
-        case .small:  return "Маленький"
-        case .medium: return "Средний"
-        case .large:  return "Большой"
+        case .small:  return String(localized: "Маленький")
+        case .medium: return String(localized: "Средний")
+        case .large:  return String(localized: "Большой")
+        }
+    }
+    // Высота горизонтальной ленты (режимы «Лента снизу/сверху»).
+    var stripHeight: CGFloat {
+        switch self {
+        case .small:  return 220
+        case .medium: return 270
+        case .large:  return 330
         }
     }
     // Текущий выбор из настроек (для кода вне SwiftUI).
@@ -78,20 +86,24 @@ enum PanelSize: String, CaseIterable {
 // MARK: - Расположение окна панели
 enum PanelPosition: String, CaseIterable {
     case underIcon, topRight, topLeft, bottomRight, bottomLeft
-    case dockRight, dockLeft   // док у края экрана во всю высоту
+    case dockRight, dockLeft     // док у бокового края во всю высоту
+    case dockBottom, dockTop     // лента во всю ширину (как в Paste)
 
     var title: String {
         switch self {
-        case .underIcon:   return "Под иконкой"
-        case .topRight:    return "Справа сверху"
-        case .topLeft:     return "Слева сверху"
-        case .bottomRight: return "Справа снизу"
-        case .bottomLeft:  return "Слева снизу"
-        case .dockRight:   return "Док справа (вся высота)"
-        case .dockLeft:    return "Док слева (вся высота)"
+        case .underIcon:   return String(localized: "Под иконкой")
+        case .topRight:    return String(localized: "Справа сверху")
+        case .topLeft:     return String(localized: "Слева сверху")
+        case .bottomRight: return String(localized: "Справа снизу")
+        case .bottomLeft:  return String(localized: "Слева снизу")
+        case .dockRight:   return String(localized: "Док справа (вся высота)")
+        case .dockLeft:    return String(localized: "Док слева (вся высота)")
+        case .dockBottom:  return String(localized: "Лента снизу (вся ширина)")
+        case .dockTop:     return String(localized: "Лента сверху (вся ширина)")
         }
     }
     var isDock: Bool { self == .dockRight || self == .dockLeft }
+    var isHorizontalDock: Bool { self == .dockBottom || self == .dockTop }
 
     static var current: PanelPosition {
         PanelPosition(rawValue: UserDefaults.standard.string(forKey: "panelPosition") ?? "topRight") ?? .topRight
@@ -109,7 +121,7 @@ let hotkeyModifierOptions: [ModifierOption] = [
 ]
 let hotkeyKeyOptions: [(name: String, code: Int)] = [
     ("V", 9), ("C", 8), ("B", 11), ("X", 7), ("Z", 6),
-    ("A", 0), ("S", 1), ("D", 2), ("Пробел", 49)
+    ("A", 0), ("S", 1), ("D", 2), (String(localized: "Пробел"), 49)
 ]
 
 // MARK: - Простой чекер обновлений через GitHub Releases
@@ -126,7 +138,7 @@ enum UpdateChecker {
     static let api = "https://api.github.com/repos/Cloncher-code/ClipboardHistory/releases?per_page=10"
 
     static func check() async -> UpdateOutcome {
-        guard let url = URL(string: api) else { return .failed("Неверный адрес") }
+        guard let url = URL(string: api) else { return .failed(String(localized: "Неверный адрес")) }
         var req = URLRequest(url: url)
         // GitHub API требует User-Agent и рекомендует заголовок Accept.
         req.setValue("ClipboardHistory-app", forHTTPHeaderField: "User-Agent")
@@ -134,10 +146,10 @@ enum UpdateChecker {
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if code == 403 { return .failed("GitHub временно ограничил запросы, попробуйте позже") }
-            guard code == 200 else { return .failed("Код ответа \(code)") }
+            if code == 403 { return .failed(String(localized: "GitHub временно ограничил запросы, попробуйте позже")) }
+            guard code == 200 else { return .failed(String(localized: "Код ответа \(code)")) }
             guard let arr = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-                return .failed("Не удалось разобрать ответ")
+                return .failed(String(localized: "Не удалось разобрать ответ"))
             }
             // Самый свежий релиз (включая пре-релизы), но не черновик.
             guard let latest = arr.first(where: { ($0["draft"] as? Bool) != true }),

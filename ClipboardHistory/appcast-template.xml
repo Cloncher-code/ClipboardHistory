@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  appcast.xml — «лента обновлений» для Sparkle.
+  Положите этот файл в ПУБЛИЧНЫЙ репозиторий релизов (например, ClipboardHistory-releases),
+  а в Info.plist приложения укажите SUFeedURL = ссылка на raw-версию этого файла.
+
+  Для каждого нового релиза добавляйте новый <item> СВЕРХУ.
+  Поля, которые нужно заменить, помечены ЗАГЛАВНЫМИ.
+-->
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>ClipboardHistory</title>
+    <item>
+      <title>Версия 1.4</title>
+      <description><![CDATA[
+        <h3>Что нового</h3>
+        <ul>
+          <li>Мультивыбор и перетаскивание записей</li>
+          <li>Заготовки, умные списки, док у края экрана</li>
+          <li>Безопасная работа с паролями</li>
+        </ul>
+      ]]></description>
+      <pubDate>ДАТА В ФОРМАТЕ RFC822, например: Mon, 06 Jul 2026 12:00:00 +0300</pubDate>
+      <sparkle:version>СБОРКА, например: 14</sparkle:version>
+      <sparkle:shortVersionString>1.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure
+        url="https://github.com/Cloncher-code/ClipboardHistory-releases/releases/download/v1.4/ClipboardHistory.zip"
+        length="РАЗМЕР ФАЙЛА В БАЙТАХ"
+        type="application/octet-stream"
+        sparkle:edSignature="ПОДПИСЬ ИЗ sign_update" />
+    </item>
+  </channel>
+</rss>

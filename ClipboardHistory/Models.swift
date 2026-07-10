@@ -90,14 +90,14 @@ enum HistoryFilter: Hashable {
 
     var title: String {
         switch self {
-        case .all: return "Все"
+        case .all: return String(localized: "Все")
         case .list(let name): return name
-        case .smartText: return "Текст"
-        case .smartLinks: return "Ссылки"
-        case .smartImages: return "Изображения"
-        case .smartToday: return "Сегодня"
-        case .smart: return "Умный список"
-        case .snippets: return "Заготовки"
+        case .smartText: return String(localized: "Текст")
+        case .smartLinks: return String(localized: "Ссылки")
+        case .smartImages: return String(localized: "Изображения")
+        case .smartToday: return String(localized: "Сегодня")
+        case .smart: return String(localized: "Умный список")
+        case .snippets: return String(localized: "Заготовки")
         }
     }
 }
@@ -114,6 +114,7 @@ enum ContentType {
     case color(NSColor)
     case email
     case link
+    case phone
     case plain
 }
 
@@ -141,12 +142,49 @@ func isEmail(_ s: String) -> Bool {
     return s.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
 }
 
+// Телефонный номер: +7 999 123-45-67, (495) 123-45-67 и т.п.
+func isPhone(_ s: String) -> Bool {
+    let pattern = "^[+]?[0-9][0-9\\s()\\-]{5,18}[0-9]$"
+    guard s.range(of: pattern, options: .regularExpression) != nil else { return false }
+    let digits = s.filter { $0.isNumber }.count
+    return digits >= 7 && digits <= 15
+}
+
+// Цвет в виде rgb(r, g, b).
+func rgbString(_ color: NSColor) -> String {
+    let c = color.usingColorSpace(.sRGB) ?? color
+    return String(format: "rgb(%d, %d, %d)",
+                  Int(round(c.redComponent * 255)),
+                  Int(round(c.greenComponent * 255)),
+                  Int(round(c.blueComponent * 255)))
+}
+
+// Цвет в виде hsl(h, s%, l%).
+func hslString(_ color: NSColor) -> String {
+    let c = color.usingColorSpace(.sRGB) ?? color
+    let r = c.redComponent, g = c.greenComponent, b = c.blueComponent
+    let mx = max(r, g, b), mn = min(r, g, b)
+    let l = (mx + mn) / 2
+    var h: CGFloat = 0, s: CGFloat = 0
+    if mx != mn {
+        let d = mx - mn
+        s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn)
+        if mx == r      { h = (g - b) / d + (g < b ? 6 : 0) }
+        else if mx == g { h = (b - r) / d + 2 }
+        else            { h = (r - g) / d + 4 }
+        h /= 6
+    }
+    return String(format: "hsl(%d, %d%%, %d%%)",
+                  Int(round(h * 360)), Int(round(s * 100)), Int(round(l * 100)))
+}
+
 func detectContentType(_ item: ClipboardItem) -> ContentType {
-    guard item.kind == .text,
+    guard item.kind == .text, item.isSensitive != true,
           let raw = item.text?.trimmingCharacters(in: .whitespacesAndNewlines) else { return .plain }
     if let color = hexColor(raw) { return .color(color) }
     if isLinkItem(item) { return .link }
     if isEmail(raw) { return .email }
+    if isPhone(raw) { return .phone }
     return .plain
 }
 
