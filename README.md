@@ -29,4 +29,4 @@
 
 ## Последний релиз
 
-- Версия 1.4 (https://github.com/Cloncher-code/ClipboardHistory/releases/download/v1.4/ClipboardHistory_v1_4.app.zip)
+- Версия 1.5 (https://github.com/Cloncher-code/ClipboardHistory/releases/download/v1.5/ClipboardHistory.app.zip)
